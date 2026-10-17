@@ -55,6 +55,33 @@ def bump_version(v):
     return f'{major}.{minor + 1}.0'
 
 
+def append_changelog(ver, notes):
+    """
+    把本次说明插到 CHANGELOG.md 最前面。
+
+    ⚠️ 必须在**构建之前**执行：CHANGELOG 会被 `?raw` 内联进前端 bundle，
+    构建后再改就进不了这个版本的安装包，设置页里会缺本次记录。
+    """
+    path = os.path.join(ROOT, 'CHANGELOG.md')
+    if not os.path.isfile(path) or not notes.strip():
+        return
+    with open(path, encoding='utf-8') as f:
+        s = f.read()
+    if re.search(rf'(?m)^##\s+v?{re.escape(ver)}\b', s):
+        print(f'  CHANGELOG 已有 {ver}，跳过追加')
+        return
+    today = datetime.now().strftime('%Y-%m-%d')
+    # 用户传的说明里可能自带 `## 修复…` 这类标题，降一级作为分组
+    body = re.sub(r'(?m)^##\s+', '### ', notes.strip())
+    entry = f'## {ver} · {today}\n\n{body}\n\n'
+    # 插到第一个 `## ` 之前（文件顶部是 `# 更新日志` 与说明段）
+    idx = s.find('\n## ')
+    s = s.rstrip() + '\n\n' + entry if idx < 0 else s[:idx + 1] + entry + s[idx + 1:]
+    with open(path, 'w', encoding='utf-8', newline='') as f:
+        f.write(s)
+    print(f'  CHANGELOG 已加入 {ver}')
+
+
 def write_version(new):
     """四处版本号必须同步：漏掉任何一处都会让「程序内显示的版本」和安装包不一致"""
     for path, pat, rep in [
@@ -174,6 +201,10 @@ def main():
     if args.bump:
         write_version(ver)
         print(f'[1/6] 版本号已改为 {ver}')
+
+    # 必须在构建之前：CHANGELOG 会被内联进前端包
+    print('[1.5/6] 写入更新日志…')
+    append_changelog(ver, args.notes)
 
     # 构建（必须带签名，否则没有 .sig，更新会因签名缺失被拒）
     if not os.environ.get('TAURI_SIGNING_PRIVATE_KEY'):

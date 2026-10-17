@@ -2,9 +2,11 @@ import { useEffect, useState } from 'react'
 import {
   HardDrive, Power, LayoutGrid, Trash2, Package, Cpu, Check, AlertTriangle,
   Minimize2, LogOut, HelpCircle, FolderCog, RefreshCw, Loader2, Download,
+  ChevronDown, ChevronUp,
 } from 'lucide-react'
 import type { AppSettings, CloseAction } from '../types'
 import { getAppSettings, updateAutostart, updateCloseAction } from '../services/api'
+import { CHANGELOG } from '../services/changelog'
 import {
   checkForUpdate, installPendingUpdate, latestUpdate, subscribeUpdate,
   getUpdateEndpoint, type UpdateCheckResult, type DownloadProgress,
@@ -107,6 +109,8 @@ export function Settings() {
   const [installing, setInstalling] = useState(false)
   const [dl, setDl] = useState<DownloadProgress | null>(null)
   const [installErr, setInstallErr] = useState('')
+  /** 更新日志是否展开（默认收起，设置页已经够长） */
+  const [showLog, setShowLog] = useState(false)
 
   useEffect(() => {
     let alive = true
@@ -434,6 +438,60 @@ export function Settings() {
           ) : (
             <div className="status-line">
               <HelpCircle size={14} /> 尚未检查
+            </div>
+          )}
+        </div>
+
+        {/*
+          更新日志：内容来自仓库根的 CHANGELOG.md，构建时内联进包，离线可看。
+          默认折叠 —— 设置页已经很长，日志只在用户主动想看时展开。
+        */}
+        <div style={{ borderTop: '1px solid var(--border)' }}>
+          <button
+            type="button"
+            onClick={() => setShowLog((v) => !v)}
+            style={{
+              width: '100%', display: 'flex', alignItems: 'center', gap: 8,
+              padding: '11px 14px', background: 'transparent', border: 'none',
+              color: 'var(--fg-2)', fontSize: 12.5, cursor: 'pointer', textAlign: 'left',
+            }}
+            aria-expanded={showLog}
+          >
+            {showLog ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+            更新日志
+            <span style={{ marginLeft: 'auto', fontSize: 11.5, color: 'var(--meta)' }}>
+              {CHANGELOG.length} 个版本
+            </span>
+          </button>
+
+          {showLog && (
+            <div style={{ padding: '2px 16px 16px', maxHeight: 340, overflowY: 'auto' }}>
+              {CHANGELOG.length === 0 ? (
+                <div style={{ fontSize: 12.5, color: 'var(--meta)' }}>暂无可显示的更新记录</div>
+              ) : (
+                CHANGELOG.map((e) => {
+                  const isCurrent = !!s && e.version.replace(/^v/i, '') === s.appVersion.replace(/^v/i, '')
+                  return (
+                    <div key={e.version} style={{ marginBottom: 16 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6, flexWrap: 'wrap' }}>
+                        <span className='mono' style={{ fontSize: 12.5, fontWeight: 600 }}>v{e.version}</span>
+                        {isCurrent && <span className='tag tag-safe'>当前版本</span>}
+                        {e.date && <span style={{ fontSize: 11.5, color: 'var(--meta)' }}>{e.date}</span>}
+                      </div>
+                      {e.groups.map((g, gi) => (
+                        <div key={gi} style={{ marginBottom: 7 }}>
+                          {g.title && (
+                            <div style={{ fontSize: 11.5, color: 'var(--muted)', marginBottom: 2 }}>{g.title}</div>
+                          )}
+                          <ul style={{ margin: 0, paddingLeft: 17, fontSize: 12.5, lineHeight: 1.8, color: 'var(--fg-2)' }}>
+                            {g.items.map((it, i) => <li key={i}>{it}</li>)}
+                          </ul>
+                        </div>
+                      ))}
+                    </div>
+                  )
+                })
+              )}
             </div>
           )}
         </div>
