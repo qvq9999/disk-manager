@@ -1,0 +1,25 @@
+# ---------- 依赖与构建产物 ----------
+node_modules/
+dist/
+src-tauri/target/
+*.tsbuildinfo
+
+# ---------- 本机开发环境（含绝对路径，换台机器就失效）----------
+# 模板见 dev-env.example.sh 与 src-tauri/.cargo/config.toml.example
+dev-env.sh
+src-tauri/.cargo/config.toml
+
+# ---------- 项目数据与开发期产物 ----------
+.workbuddy/
+release/
+
+# ---------- 签名密钥（私钥一旦泄露，别人就能签出可被接受的更新包）----------
+*.key
+*.key.pub
+*.sig
+
+# ---------- 编辑器 / 系统 ----------
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini

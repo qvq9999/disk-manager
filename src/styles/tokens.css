@@ -1,0 +1,108 @@
+/* ============ Design Tokens —— Disk Manager ============ */
+/* 设计语言: Fluent 2 × Linear 克制纪律 | 强调色 Cobalt Azure #1D6FDF */
+:root {
+  /* 字体：只用确定存在的 Windows 系统字体（此前 Manrope/JetBrains Mono 本机缺失导致错乱与缺字） */
+  --font-display: "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+  --font-body: "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+  --font-mono: "Cascadia Mono", "Consolas", "Microsoft YaHei UI", "Microsoft YaHei", monospace;
+
+  /* Light 主题 */
+  --bg: #f6f7f9;
+  --surface: #ffffff;
+  --surface-warm: #eef0f3;
+  --fg: #14181f;
+  --fg-2: #333a45;
+  --muted: #5a6472;
+  --meta: #8a93a1;
+  --border: #e3e6eb;
+  --border-soft: #eef1f4;
+
+  --accent: #1d6fdf;
+  --accent-hover: #1a63c7;
+  --accent-active: #1757af;
+  --accent-on: #ffffff;
+  --accent-soft: #e8f1fc;
+
+  --success: #16a34a;
+  --warn: #d97706;
+  --danger: #dc2626;
+  --info: #1d6fdf;
+
+  /* 容量语义 */
+  --cap-free: #16a34a;
+  --cap-used: #1d6fdf;
+  --cap-warn: #d97706;
+  --cap-danger: #dc2626;
+  --cap-system: #64748b;
+
+  /* Treemap 分类色 (8类) */
+  --cat-video: #2f6bd8;
+  --cat-image: #16a34a;
+  --cat-audio: #c2410c;
+  --cat-doc: #0e7490;
+  --cat-archive: #a16207;
+  --cat-app: #6d28d9;
+  --cat-system: #64748b;
+  --cat-other: #9aa3b0;
+
+  /* 圆角 */
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+
+  /* 间距 4px 网格 */
+  --sp-1: 4px; --sp-2: 8px; --sp-3: 12px; --sp-4: 16px;
+  --sp-5: 20px; --sp-6: 24px; --sp-8: 32px; --sp-10: 40px;
+
+  /* 响应式断点与布局尺寸（R1）——CSS 媒体查询使用字面量 px，JS matchMedia 引用同值 */
+  --bp-sm: 768px;   /* < 此值：侧栏抽屉，全部单列 */
+  --bp-md: 1024px;  /* < 此值：侧栏图标态 */
+  --bp-lg: 1280px;  /* < 此值：侧栏收窄 */
+  --sidebar-w: 216px;
+  --sidebar-w-md: 200px;
+  --sidebar-w-sm: 72px;
+  --content-max: 1440px;
+
+  /* 状态语义色：健康 / 温度（R3 硬盘详情用） */
+  --state-good: var(--success);
+  --state-caution: var(--warn);
+  --state-bad: var(--danger);
+  --temp-cold: var(--success);
+  --temp-warm: var(--warn);
+  --temp-hot: var(--danger);
+
+  /* 动效 */
+  --ease: cubic-bezier(0.2, 0, 0, 1);
+  --t-fast: 120ms var(--ease);
+  --t-base: 150ms var(--ease);
+  --t-slow: 240ms var(--ease);
+}
+
+[data-theme="dark"] {
+  --bg: #14161a;
+  --surface: #1c1f24;
+  --surface-warm: #232730;
+  --fg: #eceef1;
+  --fg-2: #c3c8d0;
+  --muted: #98a0ac;
+  --meta: #6b727e;
+  --border: #2a2f37;
+  --border-soft: rgba(255, 255, 255, 0.06);
+
+  --accent: #4e8df2;
+  --accent-hover: #639cf3;
+  --accent-active: #7aa9f4;
+  --accent-on: #0d1117;
+  --accent-soft: #1d2a3d;
+
+  --success: #3fb950;
+  --warn: #d29922;
+  --danger: #f85149;
+  --info: #4e8df2;
+
+  --cap-free: #3fb950;
+  --cap-used: #4e8df2;
+  --cap-warn: #d29922;
+  --cap-danger: #f85149;
+  --cap-system: #8b95a5;
+}
