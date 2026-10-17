@@ -86,6 +86,39 @@ export function Cleanup() {
   /** 清理后的重扫是否失败：失败时必须明确告知「数字可能仍是清理前状态」 */
   const [refreshFailed, setRefreshFailed] = useState(false)
 
+  /**
+   * 清理进度的帧合并。
+   *
+   * 后端每删一项就推一次进度（含「正在删哪个路径」），一个软件缓存目录动辄几十项。
+   * 直接 setState 会让整页在几十毫秒内连续重渲染，叠加列表本身的布局计算，
+   * 视觉上就是「乱闪」。这里用 requestAnimationFrame 合并到每帧最多一次，
+   * 并且跳过**内容未变**的文本更新（同一个路径重复推送很常见）。
+   */
+  const progressFrame = useRef(0)
+  const pendingProgress = useRef<{ pct?: number; cur?: string }>({})
+  const currentRef = useRef('')
+
+  const pushProgress = (pct?: number, cur?: string) => {
+    if (pct !== undefined) pendingProgress.current.pct = pct
+    if (cur && cur !== currentRef.current) pendingProgress.current.cur = cur
+    if (progressFrame.current) return
+    progressFrame.current = requestAnimationFrame(() => {
+      progressFrame.current = 0
+      const p = pendingProgress.current
+      pendingProgress.current = {}
+      if (p.pct !== undefined) setProgress(p.pct)
+      if (p.cur) {
+        currentRef.current = p.cur
+        setCurrent(p.cur)
+      }
+    })
+  }
+
+  // 卸载时取消挂起的帧，避免对已卸载组件 setState
+  useEffect(() => () => {
+    if (progressFrame.current) cancelAnimationFrame(progressFrame.current)
+  }, [])
+
   // 盘符列表：仅枚举（会话级缓存），不触发清理扫描
   useEffect(() => {
     getVolumes()
@@ -224,14 +257,17 @@ export function Cleanup() {
     const count = chosenItems.length
     setPhase('cleaning')
     setProgress(0)
+    currentRef.current = ''
     try {
       const [actual, failedCount] = await runClean([...sel], (p) => {
-        if (p.current) setCurrent(p.current)
-        if (typeof p.freed === 'number' && totalSel > 0) {
-          setProgress(Math.min(99, Math.round((p.freed / totalSel) * 100)))
-        } else if (typeof p.pct === 'number') {
-          setProgress(Math.min(99, p.pct))
-        }
+        // 百分比优先按「已释放 / 预估总量」算：比后端的分段百分比更贴近实际
+        const pct =
+          typeof p.freed === 'number' && totalSel > 0
+            ? Math.min(99, Math.round((p.freed / totalSel) * 100))
+            : typeof p.pct === 'number'
+              ? Math.min(99, p.pct)
+              : undefined
+        pushProgress(pct, p.current)
       }, chosen, totalSel)
       setProgress(100)
       setFreed(actual)
@@ -381,16 +417,6 @@ export function Cleanup() {
           </>
         )}
         <div className='sum-spacer' />
-        {phase === 'cleaning' && (
-          <div style={{ flex: 1, maxWidth: 360 }}>
-            <div className='progress-track'><div className='progress-fill' style={{ width: `${progress}%` }} /></div>
-            <div className='status-line' style={{ marginTop: 6 }}>
-              <Loader2 size={13} className='spin' />
-              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 240 }}>{current || '正在删除…'}</span>
-              {Math.round(progress)}%
-            </div>
-          </div>
-        )}
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <button
             className='btn btn-ghost'
@@ -413,6 +439,28 @@ export function Cleanup() {
           </button>
         </div>
       </div>
+
+      {/*
+        清理进度独立成行，不再嵌在 .summary-bar 里。
+        原来它和 .sum-spacer 都是 flex:1，进度块宽度随「当前正在删的路径」长度变化，
+        会把右侧三个按钮推来推去 —— 这是清理时页面乱晃的直接原因之一。
+      */}
+      {phase === 'cleaning' && (
+        <div style={{ marginBottom: 14 }}>
+          <div className='progress-track' style={{ height: 6 }}>
+            <div className='progress-fill' style={{ width: `${progress}%` }} />
+          </div>
+          <div className='status-line' style={{ marginTop: 6, gap: 8 }}>
+            <Loader2 size={13} className='spin' />
+            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, minWidth: 0 }}>
+              {current || '正在删除…'}
+            </span>
+            <span className='mono' style={{ fontSize: 11.5, color: 'var(--meta)', flexShrink: 0 }}>
+              {Math.round(progress)}%
+            </span>
+          </div>
+        </div>
+      )}
 
       {/* 清理完成摘要：释放空间 / 清理前后对比 / 刷新状态 */}
       {isDone && (
@@ -460,8 +508,11 @@ export function Cleanup() {
         </div>
       )}
 
-      {/* 勾选进度：完成态且未再勾选时，改为说明文字（不再显示满格 100% 进度条） */}
-      {isDone && selCount === 0 ? (
+      {/*
+        勾选进度：完成态且未再勾选时，改为说明文字（不再显示满格 100% 进度条）。
+        清理过程中整块隐藏 —— 此时上方已有真实删除进度，两条进度条并排反而看着乱。
+      */}
+      {phase === 'cleaning' ? null : isDone && selCount === 0 ? (
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 16, fontSize: 11.5, color: 'var(--meta)', flexWrap: 'wrap' }}>
           <Check size={13} color="var(--success)" />
           以下为清理后的剩余项目（默认不勾选）；需要继续清理时勾选后再点右侧按钮
@@ -484,29 +535,34 @@ export function Cleanup() {
           {isDone ? '已全部清理干净，未发现剩余可清理项' : '未发现可清理项（所选盘符已很干净）'}
         </div>
       ) : (
-        <div className='clean-cols' style={{ opacity: refreshing ? 0.55 : 1, transition: 'opacity .15s' }}>
-          {[0, 1].map((colIdx) => (
-            <div className='clean-col' key={colIdx}>
-              {cats.filter((c) => c.items.length > 0).filter((_, i) => i % 2 === colIdx).map((cat) => {
-                const Icon = CAT_ICON[cat.icon] ?? HardDrive
-                // 与顶部「可清理总量」口径一致：分类标题只统计可清理项，
-                // 不可删项（pagefile 等）单独以小字标注，避免「卡片 8GB 而汇总 0B」的错觉
-                const catSize = cat.items.filter((i) => i.safe).reduce((s, i) => s + i.size, 0)
-                const catLocked = cat.items.filter((i) => !i.safe).reduce((s, i) => s + i.size, 0)
-                const ids = cat.items.filter((i) => i.safe).map((i) => i.id)
-                const allOn = ids.length > 0 && ids.every((id) => sel.has(id))
-                const isCollapsed = collapsed.has(cat.id)
-                return (
-                  <div key={cat.id} className='clean-card'>
-                    <div className='clean-card-head'>
-                      <button
-                        className={`checkbox${allOn ? ' on' : ''}`}
-                        style={{ visibility: ids.length > 0 ? 'visible' : 'hidden' }}
-                        onClick={() => toggleCatAll(cat)}
-                        title={allOn ? '取消全选本类' : '全选本类'}
-                      >
-                        <Check size={12} />
-                      </button>
+        // 单层 DOM + CSS 多列：分类顺序固定，数据变化时卡片不会跨列搬迁。
+        // 重扫期间不再整体降透明度（原来 opacity 0.55 会让整页闪一下），
+        // 改用顶部提示 + 禁用交互表达「正在忙」。
+        <div
+          className='clean-cols'
+          style={refreshing ? { pointerEvents: 'none' } : undefined}
+          aria-busy={refreshing}
+        >
+          {cats.filter((c) => c.items.length > 0).map((cat) => {
+            const Icon = CAT_ICON[cat.icon] ?? HardDrive
+            // 与顶部「可清理总量」口径一致：分类标题只统计可清理项，
+            // 不可删项（pagefile 等）单独以小字标注，避免「卡片 8GB 而汇总 0B」的错觉
+            const catSize = cat.items.filter((i) => i.safe).reduce((s, i) => s + i.size, 0)
+            const catLocked = cat.items.filter((i) => !i.safe).reduce((s, i) => s + i.size, 0)
+            const ids = cat.items.filter((i) => i.safe).map((i) => i.id)
+            const allOn = ids.length > 0 && ids.every((id) => sel.has(id))
+            const isCollapsed = collapsed.has(cat.id)
+            return (
+              <div key={cat.id} className='clean-card'>
+                <div className='clean-card-head'>
+                  <button
+                    className={`checkbox${allOn ? ' on' : ''}`}
+                    style={{ visibility: ids.length > 0 ? 'visible' : 'hidden' }}
+                    onClick={() => toggleCatAll(cat)}
+                    title={allOn ? '取消全选本类' : '全选本类'}
+                  >
+                    <Check size={12} />
+                  </button>
                       <span className='clean-card-icon' style={{ background: 'var(--accent-soft)', color: 'var(--accent)' }}>
                         <Icon size={15} />
                       </span>
@@ -571,8 +627,6 @@ export function Cleanup() {
                   </div>
                 )
               })}
-            </div>
-          ))}
         </div>
       )}
 

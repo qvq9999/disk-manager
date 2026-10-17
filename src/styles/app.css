@@ -392,6 +392,8 @@ input:focus { outline: none; border-color: var(--accent); }
   page-break-inside: avoid;
   display: inline-block;
   width: 100%;
+  /* 多列布局下相邻卡片会贴在一起，靠 margin 撑开（原来靠 flex 的 gap） */
+  margin-bottom: var(--sp-4);
   margin-bottom: var(--sp-4);
   vertical-align: top;
 }
@@ -430,13 +432,21 @@ input:focus { outline: none; border-color: var(--accent); }
 @keyframes modal-in { from { opacity: 0; transform: translateY(10px) scale(0.98); } to { opacity: 1; transform: none; } }
 
 /* ============ 清理页：两列独立布局（展开互不影响） ============ */
+/*
+ * 卡片流式两列。
+ *
+ * 原来用「两层 div 各 flex:1 + 按索引 i%2 分列」，有两个实际后果：
+ *   · 数据一变（清理后重扫、分类数量变化），同一张卡片会从右列跳到左列，
+ *     父节点变了 React 只能销毁重建 DOM —— 视觉上就是整片乱闪
+ *   · 窄屏媒体查询把 .clean-cols 改成 column 方向后，两列变成上下堆叠，
+ *     但内容仍是「先所有偶数索引、再所有奇数索引」，顺序完全错乱
+ * 改成 CSS 多列：单层 DOM 按顺序流式排布，窄屏只需把列数改成 1。
+ */
 .clean-cols {
-  display: flex;
-  gap: var(--sp-4);
-  align-items: flex-start;
+  columns: 2;
+  column-gap: var(--sp-4);
   padding-bottom: var(--sp-4);
 }
-.clean-col { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; gap: var(--sp-4); }
 .app-row {
   display: flex; align-items: center; gap: var(--sp-3);
   padding: 10px var(--sp-4);
@@ -529,8 +539,7 @@ input:focus { outline: none; border-color: var(--accent); }
   .perm-box { display: none; }
   .sidebar-foot { justify-content: center; padding: var(--sp-3) 0 0; }
   .detail-layout { grid-template-columns: 1fr; }
-  .clean-cols { flex-direction: column; }
-  .clean-col { width: 100%; }
+  .clean-cols { columns: 1; }
   .clean-grid { columns: 1; }
   .drive-grid { grid-template-columns: 1fr; }
   .topbar { padding: 0 var(--sp-4); }
