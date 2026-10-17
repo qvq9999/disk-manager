@@ -52,7 +52,7 @@ export TAURI_SIGNING_PRIVATE_KEY=~/.tauri/disk-manager.key
 npx tauri build --bundles nsis
 
 # 3. 生成更新清单
-python scripts/make_latest_json.py --repo <用户名>/<仓库名> --notes "更新说明"
+python scripts/make_latest_json.py --repo qvq9999/disk-manager --notes "更新说明"
 ```
 
 然后把 `release/` 下的三个文件上传到 GitHub Release：

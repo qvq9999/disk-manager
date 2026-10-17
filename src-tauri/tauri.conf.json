@@ -28,7 +28,7 @@
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDU5QzI1RUFDQUMxODc5OEUKUldTT2VSaXNyRjdDV2FONEtPVFNBL1VhZVlGUUltZzVNZmVjMGJvK0w5eHBpOGo4d3IwcGdOdCsK",
       "endpoints": [
-        "https://github.com/OWNER/REPO/releases/latest/download/latest.json"
+        "https://github.com/qvq9999/disk-manager/releases/latest/download/latest.json"
       ],
       "windows": {
         "installMode": "passive"
