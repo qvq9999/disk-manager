@@ -87,7 +87,26 @@ def repo_from_remote():
     return f'{m.group(1)}/{m.group(2)}' if m else None
 
 
-def api(method, path, payload=None, token=None, raw_file=None):
+def push_with_token(token, repo):
+    """
+    推送主分支。
+
+    本机环境的两个坑（换机器时可能不存在，但保留这段逻辑不会有副作用）：
+    1. 全局 gitconfig 有 `url.'https://ghproxy.net/https://github.com/'.insteadOf`，
+       ghproxy 是只读加速代理，push 会报 "could not read Username"。
+       → 把 token 写进 URL，前缀不再匹配 `https://github.com/`，自然绕过重写。
+    2. 直连 github.com 时 schannel 报 CRYPT_E_NO_REVOCATION_CHECK（代理 MITM 证书无法查吊销），
+       → GIT_SSL_NO_VERIFY=true。仅影响这一次推送，不写入任何配置。
+    """
+    url = f'https://x-access-token:{token}@github.com/{repo}.git'
+    env = os.environ.copy()
+    env['GIT_SSL_NO_VERIFY'] = 'true'
+    env['GIT_TERMINAL_PROMPT'] = '0'
+    out = sh(['git', 'push', url, 'HEAD:main', '--follow-tags'], check=False, env=env)
+    return out
+
+
+def api(method, path, payload=None, token=None):
     url = path if path.startswith('http') else 'https://api.github.com' + path
     headers = {
         'Authorization': f'Bearer {token}',
@@ -95,11 +114,7 @@ def api(method, path, payload=None, token=None, raw_file=None):
         'User-Agent': 'disk-manager-release',
     }
     data = None
-    if raw_file:
-        headers['Content-Type'] = 'application/octet-stream'
-        with open(raw_file, 'rb') as f:
-            data = f.read()
-    elif payload is not None:
+    if payload is not None:
         headers['Content-Type'] = 'application/json'
         data = json.dumps(payload).encode('utf-8')
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
@@ -110,6 +125,29 @@ def api(method, path, payload=None, token=None, raw_file=None):
     except urllib.error.HTTPError as e:
         detail = e.read().decode('utf-8', 'replace')[:600]
         raise RuntimeError(f'{method} {path} -> {e.code}: {detail}') from None
+
+
+def upload_asset(upload_base, name, path, token):
+    """
+    上传 Release 资产。
+
+    ⚠️ 这里用 curl 而不是 urllib：本机走本地代理时，urllib 对 uploads.github.com 的
+    CONNECT 隧道会返回 502，而 curl 走同样的代理正常。实测 latest.json / .sig / 3.7MB
+    安装包三者 curl 均为 201。
+    """
+    cmd = ['curl', '-sS', '--ssl-no-revoke', '-X', 'POST',
+           '-H', f'Authorization: Bearer {token}',
+           '-H', 'Content-Type: application/octet-stream',
+           '-H', 'User-Agent: disk-manager-release',
+           '--data-binary', f'@{path}',
+           f'{upload_base}?name={name}',
+           '-w', 'HTTP:%{http_code}', '-o', os.devnull, '-m', '900']
+    out = sh(cmd, check=False)
+    m = re.search(r'HTTP:(\d{3})', out)
+    code = m.group(1) if m else '000'
+    if code not in ('200', '201'):
+        raise RuntimeError(f'上传 {name} 失败，HTTP {code}')
+    return code
 
 
 def main():
@@ -164,13 +202,15 @@ def main():
         sys.exit('缺少 GH_TOKEN，无法创建 Release。可先 git push，再手动上传 release/ 下的文件')
 
     print('[5/6] 推送代码与标签…')
-    sh('git push origin HEAD --follow-tags', check=False)
+    push_out = push_with_token(token, repo)
+    print('  ' + (push_out.strip().splitlines()[-1] if push_out.strip() else '已推送'))
 
     print('[6/6] 创建 Release 并上传…')
     try:
         rel = api('POST', f'/repos/{repo}/releases', {
             'tag_name': tag,
             'name': tag,
+            'target_commitish': 'main',
             'body': args.notes or f'版本 {ver}',
             'draft': False,
             'prerelease': False,
@@ -184,6 +224,7 @@ def main():
             raise
 
     upload_base = rel['upload_url'].split('{')[0]
+    rel = api('GET', f'/repos/{repo}/releases/tags/{tag}', token=token)
     for name in [f for f in os.listdir(RELEASE_DIR) if f.endswith(('.exe', '.sig'))] + ['latest.json']:
         path = os.path.join(RELEASE_DIR, name)
         if not os.path.isfile(path):
@@ -192,7 +233,7 @@ def main():
         for a in rel.get('assets', []):
             if a['name'] == name:
                 api('DELETE', f'/repos/{repo}/releases/assets/{a["id"]}', token=token)
-        api('POST', f'{upload_base}?name={name}', token=token, raw_file=path)
+        upload_asset(upload_base, name, path, token)
         print(f'  已上传 {name}')
 
     print(f'\n[完成] v{ver} 已发布：https://github.com/{repo}/releases/tag/{tag}')
