@@ -225,7 +225,11 @@ def main():
 
     upload_base = rel['upload_url'].split('{')[0]
     rel = api('GET', f'/repos/{repo}/releases/tags/{tag}', token=token)
-    for name in [f for f in os.listdir(RELEASE_DIR) if f.endswith(('.exe', '.sig'))] + ['latest.json']:
+    # 只上传与**本次版本**匹配的包：release/ 里可能残留旧版本文件，
+    # 一并上传会让新 Release 混入旧安装包（v1.2.0 实际踩过）
+    want = [f for f in os.listdir(RELEASE_DIR)
+            if f.endswith(('.exe', '.sig')) and f'_{ver}_' in f] + ['latest.json']
+    for name in want:
         path = os.path.join(RELEASE_DIR, name)
         if not os.path.isfile(path):
             continue

@@ -99,6 +99,13 @@ def main():
     }
 
     os.makedirs(OUT_DIR, exist_ok=True)
+    # 先清掉上一次发版留下的安装包。
+    # 否则 release/ 会越攒越多，而 release.py 是按「release/ 下所有 .exe/.sig」上传的，
+    # 结果新版本的 Release 里混进旧版本安装包（v1.2.0 实际踩过）。
+    for f in os.listdir(OUT_DIR):
+        if f.endswith(('.exe', '.sig')):
+            os.remove(os.path.join(OUT_DIR, f))
+
     out_json = os.path.join(OUT_DIR, 'latest.json')
     with open(out_json, 'w', encoding='utf-8') as f:
         json.dump(latest, f, ensure_ascii=False, indent=2)
