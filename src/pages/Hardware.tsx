@@ -8,6 +8,31 @@ import { getHardwareInfo, hardwareCacheInfo, peekHardwareInfo } from '../service
 import { PageLoading } from '../components/Loading'
 import { fmtBytes } from '../utils/format'
 
+/**
+ * 拼接并去重。
+ *
+ * 为什么要它：部分主板（实测 JGINYUE B450I）的 BIOS 把主板型号原样写进了
+ * SystemProductName，于是 `BaseBoard.Product` 与 `ComputerSystemProduct.Name`
+ * 完全相同，直接拼会显示成「B450I-PLUS/ARGB B450I-PLUS/ARGB」。
+ */
+function joinUnique(...parts: Array<string | undefined | null>): string {
+  const out: string[] = []
+  for (const raw of parts) {
+    const v = (raw ?? '').trim()
+    if (!v) continue
+    const k = v.toLowerCase()
+    if (out.some((o) => o.toLowerCase() === k)) continue
+    out.push(v)
+  }
+  return out.join(' ')
+}
+
+/** a 是否已包含 b（忽略大小写）：用于避免品牌重复出现 */
+function coversWhole(a: string, b: string): boolean {
+  const x = b.trim().toLowerCase()
+  return x.length > 0 && a.toLowerCase().includes(x)
+}
+
 function fmtUptime(secs: number): string {
   if (!secs || secs <= 0) return '—'
   const d = Math.floor(secs / 86400)
@@ -154,6 +179,15 @@ export function Hardware() {
     g.driverVersion ? `驱动 ${g.driverVersion}` : '',
   ])
 
+  // 型号去重：主板厂常把主板型号同时写进 SystemProductName（本机就是这样），
+  // 直接拼接会出现同一个型号显示两遍。
+  const modelTitle = joinUnique(info.motherboard.product, info.motherboard.systemModel)
+  const boardPrimary = joinUnique(info.motherboard.manufacturer, info.motherboard.product)
+  // 品牌已经在「主板」卡的主标题里了，chip 再放一次就是重复
+  const boardChips = info.motherboard.systemManufacturer && !coversWhole(boardPrimary, info.motherboard.systemManufacturer)
+    ? [info.motherboard.systemManufacturer]
+    : undefined
+
   return (
     <div className="page-enter">
       {/* 标题行：机器名 + 读取时间 + 识别方法 / 刷新 */}
@@ -203,7 +237,7 @@ export function Hardware() {
 
       {/* 顶部摘要：型号 / 系统 / 运行时间 */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(230px, 1fr))', gap: 12, marginBottom: 20 }}>
-        <SummaryCard label="型号信息" value={`${info.motherboard.product || ''} ${info.motherboard.systemModel || ''}`.trim()} />
+        <SummaryCard label="型号信息" value={modelTitle} />
         <SummaryCard
           label="系统信息"
           value={`${(info.system.caption || '').replace(/Microsoft\s*/i, '')}${info.system.arch ? ` ${info.system.arch}` : ''}`.trim()}
@@ -240,9 +274,9 @@ export function Hardware() {
         <SpecCard
           icon={<CircuitBoard size={15} />}
           label="主板"
-          primary={`${info.motherboard.manufacturer || ''} ${info.motherboard.product || ''}`.trim() || '—'}
+          primary={boardPrimary || '—'}
           secondary={info.motherboard.biosVersion ? `BIOS ${info.motherboard.biosVersion}` : undefined}
-          chips={info.motherboard.systemManufacturer ? [info.motherboard.systemManufacturer] : undefined}
+          chips={boardChips}
           minH={124}
         />
       </div>

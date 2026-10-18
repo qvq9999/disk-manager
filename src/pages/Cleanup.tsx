@@ -13,6 +13,7 @@ import {
 import { fmtBytes } from '../utils/format'
 import { InstallerClean } from './cleanup/InstallerClean'
 import { EmptyDirClean } from './cleanup/EmptyDirClean'
+import { EmptyArtIcon } from './cleanup/EmptyArtIcon'
 
 /**
  * 页面状态机
@@ -32,19 +33,6 @@ const CAT_ICON: Record<string, typeof FileClock> = {
 }
 
 /** 空态插画（轻量内联 SVG，跟随主题色） */
-function EmptyArt() {
-  return (
-    <svg width='112' height='112' viewBox='0 0 112 112' fill='none' aria-hidden='true'>
-      <circle cx='56' cy='56' r='52' fill='var(--accent-soft)' />
-      <rect x='34' y='28' width='44' height='52' rx='8' stroke='var(--accent)' strokeWidth='3' />
-      <circle cx='56' cy='50' r='9' stroke='var(--accent)' strokeWidth='3' />
-      <line x1='48' y1='28' x2='64' y2='28' stroke='var(--border)' strokeWidth='3' />
-      <circle cx='72' cy='72' r='15' fill='var(--surface)' stroke='var(--accent)' strokeWidth='3' />
-      <line x1='83' y1='83' x2='93' y2='93' stroke='var(--accent)' strokeWidth='4' strokeLinecap='round' />
-    </svg>
-  )
-}
-
 function hhmm(ts: number | null): string {
   if (!ts) return '—'
   const d = new Date(ts)
@@ -320,7 +308,7 @@ function JunkScan() {
     return (
       <div className='page-enter' style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
         <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 20, padding: '24px 0' }}>
-          <EmptyArt />
+          <EmptyArtIcon icon={Trash2} />
           <div style={{ textAlign: 'center' }}>
             <div style={{ fontSize: 16, fontWeight: 600, marginBottom: 6 }}>选择要扫描的盘符，开始扫描</div>
             <div style={{ fontSize: 12.5, color: 'var(--muted)', lineHeight: 1.7 }}>

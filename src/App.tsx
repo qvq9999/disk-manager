@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react'
 import { Cpu, HardDrive, Trash2, Package, Sun, Moon, AlertTriangle, Menu, Settings as SettingsIcon } from 'lucide-react'
 import type { Page, Volume } from './types'
-import { getVolumes, peekVolumes, warmUp, isElevated, restartAsAdmin, onCloseRequested } from './services/api'
+import { getVolumes, peekVolumes, warmUp, isElevated, restartAsAdmin, onCloseRequested, peekDriveTree } from './services/api'
+import { startScan, getScanTask } from './services/scanTasks'
 import { installNativeShell } from './services/native'
 import { checkForUpdate, subscribeUpdate, latestUpdate } from './services/update'
 import { ErrorBoundary } from './components/ErrorBoundary'
@@ -89,6 +90,26 @@ export default function App() {
     getVolumes().then(setVolumes).catch(() => setVolumes([]))
     isElevated().then(setAdmin).catch(() => setAdmin(false))
   }, [])
+
+  // 启动预热：空闲时静默扫一遍系统盘。
+  //
+  // 全盘遍历要几十秒，用户点进「空间分析」后对着进度条干等，是最费体感的一处。
+  // 与其去抠那几十秒，不如把它挪到用户还没进页面的时候做掉。
+  // 约束：窗口可见才做、已有结果或任务就不重复、延迟 12 秒避开开机抢 IO。
+  useEffect(() => {
+    if (volumes.length === 0) return
+    const first = volumes.find((v) => v.letter.toUpperCase() === 'C') ?? volumes[0]
+    if (!first) return
+    const letter = first.letter.toUpperCase()
+    if (getScanTask(letter) || peekDriveTree(letter)) return
+
+    const t = window.setTimeout(() => {
+      if (document.visibilityState !== 'visible') return
+      if (getScanTask(letter) || peekDriveTree(letter)) return
+      void startScan(letter, false, true)
+    }, 12_000)
+    return () => window.clearTimeout(t)
+  }, [volumes])
 
   const elevate = async () => {
     try {

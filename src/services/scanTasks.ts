@@ -31,6 +31,8 @@ export interface ScanTask {
   current: string
   /** 用户是否已经看过结果（总览页只在没看过时提示） */
   seen: boolean
+  /** 是否是启动预热发起的（用户主动扫描时要给它让路） */
+  prewarm: boolean
 }
 
 const tasks = new Map<string, ScanTask>()
@@ -106,6 +108,9 @@ function ensurePoll() {
     try {
       const st = await queryScanStatus()
       for (const t of running) {
+        // 进度只属于正在被遍历的那个盘。其他盘此刻是在锁上排队，
+        // 把别人的数字显示给他，看起来就像「扫描卡住了但数字在涨」。
+        if (st.letter && st.letter !== t.letter) continue
         // 数值没变就不 emit，避免无谓的整体重渲染
         if (st.entries === t.entries && st.current === t.current) continue
         patch(t.letter, { entries: st.entries, current: st.current })
@@ -119,10 +124,22 @@ function ensurePoll() {
 /**
  * 发起一次扫描（已有运行中的任务则复用，不会重复扫盘）。
  * 永远不向外抛错：失败/中止都落在任务状态里，避免触发全局 unhandledrejection。
+ *
+ * `prewarm` 由启动预热传入：后端全盘扫描是串行的，如果预热正在扫 C 盘、
+ * 用户又点了 D 盘，D 会在锁上排队，而界面上却显示着 C 盘的进度。
+ * 所以用户一旦主动扫描，就先把预热任务取消掉，把磁盘让出来。
  */
-export function startScan(letter: string, force = false): Promise<void> {
+export function startScan(letter: string, force = false, prewarm = false): Promise<void> {
   const exist = tasks.get(letter)
   if (isTaskRunning(exist)) return Promise.resolve()
+
+  if (!prewarm) {
+    for (const t of tasks.values()) {
+      if (t.status === 'scanning' && t.prewarm && t.letter !== letter) {
+        void stopScan(t.letter)
+      }
+    }
+  }
 
   tasks.set(letter, {
     letter,
@@ -135,6 +152,7 @@ export function startScan(letter: string, force = false): Promise<void> {
     entries: 0,
     current: '',
     seen: exist?.seen ?? false,
+    prewarm,
   })
   emit()
   ensurePoll()

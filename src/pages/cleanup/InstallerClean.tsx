@@ -9,6 +9,7 @@ import {
 } from '../../services/api'
 import { fmtBytes } from '../../utils/format'
 import { DrivePicker } from './DrivePicker'
+import { EmptyArtIcon } from './EmptyArtIcon'
 
 /**
  * 安装包专项清理
@@ -134,9 +135,7 @@ export function InstallerClean() {
     const scanning = phase === 'scanning'
     return (
       <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 20, padding: '24px 0' }}>
-        <div style={{ width: 96, height: 96, borderRadius: '50%', background: 'var(--accent-soft)', display: 'grid', placeItems: 'center', color: 'var(--accent)' }}>
-          <Package size={44} strokeWidth={1.6} />
-        </div>
+        <EmptyArtIcon icon={Package} />
         <div style={{ textAlign: 'center', maxWidth: 560 }}>
           <div style={{ fontSize: 16, fontWeight: 600, marginBottom: 6 }}>扫描设备中的安装包文件</div>
           <div style={{ fontSize: 12.5, color: 'var(--muted)', lineHeight: 1.7 }}>

@@ -247,6 +247,8 @@ export interface ScanStatus {
   active: boolean
   entries: number
   current: string
+  /** 真正在遍历的盘符：前端据此区分「我在扫」和「我在排队」 */
+  letter: string
 }
 
 /**
@@ -265,7 +267,7 @@ export async function requestDriveScan(letter: string, force = false): Promise<F
 /** 查询当前扫描进度；无扫描在跑时 active=false */
 export async function queryScanStatus(): Promise<ScanStatus> {
   if (!isTauri) {
-    return { active: mockScan.active, entries: mockScan.entries, current: mockScan.current }
+    return { active: mockScan.active, entries: mockScan.entries, current: mockScan.current, letter: 'C' }
   }
   return inv<ScanStatus>('scan_status')
 }
@@ -658,7 +660,9 @@ const mockHardware: HardwareInfo = {
   gpu: [{ name: '示例显卡 RTX 3060 Ti', vramBytes: 8 * GB, driverVersion: '00.0.0000.0', vendor: 'NVIDIA' }],
   monitors: [{ name: 'P2410R3', manufacturer: '示例显示器厂', sizeInch: 24 }],
   disks: [{ model: '示例 SSD 1TB', sizeBytes: 1000 * GB, media: 'SSD', bus: 'NVMe' }],
-  motherboard: { manufacturer: '示例主板厂', product: 'B450I-PLUS/ARGB', biosVersion: 'AMI v1.0', systemModel: '台式电脑', systemManufacturer: 'DIY' },
+  // 故意让 systemModel 与 product 相同：部分主板（如 JGINYUE B450I）的 BIOS 就是这么写的，
+  // 预览里保留这个情形，防止「型号显示两遍」的修复被后来的改动悄悄改回去。
+  motherboard: { manufacturer: '示例主板厂', product: 'B450I-PLUS/ARGB', biosVersion: 'AMI v1.0', systemModel: 'B450I-PLUS/ARGB', systemManufacturer: '示例主板厂' },
   system: { caption: 'Microsoft Windows 11 专业版', version: '10.0.26100', build: '26100', arch: '64 位' },
   sound: ['High Definition Audio 设备', '示例 USB 耳机'],
   network: [{ name: '示例 Wi-Fi 6E 网卡', kind: '无线' }, { name: '示例 2.5GbE 网卡', kind: '有线' }],
