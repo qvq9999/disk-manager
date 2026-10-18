@@ -129,7 +129,7 @@ export default function App() {
           <div className="brand-icon"><HardDrive size={17} /></div>
           <div className="brand-text">
             <div className="brand-name">存储管理</div>
-            <div className="brand-sub">Disk Manager v1.3</div>
+            <div className="brand-sub">Disk Manager v{__APP_VERSION__}</div>
           </div>
         </div>
         {NAV.map(({ id, label, icon: Icon }) => (

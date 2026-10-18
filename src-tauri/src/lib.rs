@@ -69,6 +69,16 @@ pub fn run() {
       // 设置必须在托盘之前载入（关闭行为依赖它）
       commands::settings::init(app.handle());
 
+      // 清理历史版本的更新器临时目录：tauri 的 updater 用 `.keep()` 建临时目录、
+      // 不会自动删除，每更新一次就在 %TEMP% 里留一个（含安装包）。
+      // 异步做，绝不阻塞主窗口出现。
+      std::thread::spawn(|| {
+        let n = commands::update::cleanup_update_leftovers();
+        if n > 0 {
+          log::info!("已清理 {n} 个更新残留目录");
+        }
+      });
+
       if let Err(e) = build_tray(app.handle()) {
         log::warn!("托盘图标创建失败，将禁用「退到后台」选项：{e}");
       }
@@ -108,6 +118,12 @@ pub fn run() {
       commands::scan::scan_status,
       commands::clean::get_clean_items,
       commands::clean::run_clean,
+      commands::installer::scan_installers,
+      commands::installer::cancel_installer_scan,
+      commands::installer::delete_installers,
+      commands::emptydir::scan_empty_dirs,
+      commands::emptydir::cancel_empty_dir_scan,
+      commands::emptydir::delete_empty_dirs,
       commands::uninstall::list_apps,
       commands::uninstall::list_win32_apps,
       commands::uninstall::list_store_apps_only,

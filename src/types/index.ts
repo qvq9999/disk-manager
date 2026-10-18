@@ -197,3 +197,23 @@ export interface HardwareInfo {
   sound: string[]
   network: NetInfo[]
 }
+
+/** 安装包专项清理：一个可删的安装包文件 */
+export interface InstallerItem {
+  /** 真实绝对路径（删除时原样回传，后端会重新校验） */
+  path: string
+  name: string
+  size: number
+  /** 修改时间（Unix 秒） */
+  mtime: number
+  /** MSI / MSIX / APPX / MSU / EXE */
+  kind: string
+}
+
+/** 空文件夹扫描：一个完全空的目录 */
+export interface EmptyDirItem {
+  path: string
+  name: string
+  depth: number
+  mtime: number
+}

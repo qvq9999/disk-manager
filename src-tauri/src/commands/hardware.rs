@@ -2,14 +2,16 @@
 //! 覆盖：CPU（物理/逻辑核）、内存（类型/频率/分条）、显卡（含显存）、显示器（型号/尺寸）、
 //! 磁盘（介质类型/总线/型号）、主板/BIOS、系统（版本/架构/运行时间）、声卡、网卡
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
 use winreg::RegKey;
-use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+use windows_sys::Win32::System::SystemInformation::{
+    GetTickCount64, GlobalMemoryStatusEx, MEMORYSTATUSEX,
+};
 
-#[derive(Serialize, Clone, Default)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct HardwareInfo {
     pub computer_name: String,
@@ -25,11 +27,11 @@ pub struct HardwareInfo {
     pub network: Vec<NetInfo>,
 }
 
-#[derive(Serialize, Clone, Default)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct CpuInfo { pub name: String, pub cores_physical: u32, pub cores_logical: u32, pub base_mhz: u64 }
 
-#[derive(Serialize, Clone, Default)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct MemoryStick {
     pub manufacturer: String,
@@ -41,37 +43,37 @@ pub struct MemoryStick {
     pub slot: String,              // 插槽位置
 }
 
-#[derive(Serialize, Clone, Default)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct MemoryInfo {
     pub total_bytes: u64, pub available_bytes: u64, pub used_pct: u32,
     pub mem_type: String, pub speed_mhz: u32, pub sticks: Vec<MemoryStick>,
 }
 
-#[derive(Serialize, Clone, Default)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct GpuInfo { pub name: String, pub vram_bytes: u64, pub driver_version: String, pub vendor: String }
 
-#[derive(Serialize, Clone, Default)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct MonitorInfo { pub name: String, pub manufacturer: String, pub size_inch: f32 }
 
-#[derive(Serialize, Clone, Default)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct DiskInfo { pub model: String, pub size_bytes: u64, pub media: String, pub bus: String }
 
-#[derive(Serialize, Clone, Default)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct BoardInfo {
     pub manufacturer: String, pub product: String, pub bios_version: String,
     pub system_model: String, pub system_manufacturer: String,
 }
 
-#[derive(Serialize, Clone, Default)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct SystemInfo { pub caption: String, pub version: String, pub build: String, pub arch: String }
 
-#[derive(Serialize, Clone, Default)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct NetInfo { pub name: String, pub kind: String }
 
@@ -79,21 +81,27 @@ const PS_SCRIPT: &str = r#"
 $ErrorActionPreference='SilentlyContinue'
 try { [Console]::OutputEncoding=[System.Text.Encoding]::UTF8 } catch {}
 $OutputEncoding=[System.Text.Encoding]::UTF8
-$os=Get-CimInstance Win32_OperatingSystem
-$cs=Get-CimInstance Win32_ComputerSystem
-$bb=Get-CimInstance Win32_BaseBoard
-$bios=Get-CimInstance Win32_BIOS
-$cpu=Get-CimInstance Win32_Processor | Select-Object -First 1
-$gpu=@(Get-CimInstance Win32_VideoController | Select-Object Name,DriverVersion,AdapterRAM,AdapterCompatibility)
-$mem=@(Get-CimInstance Win32_PhysicalMemory | Select-Object Manufacturer,Capacity,Speed,ConfiguredClockSpeed,ConfiguredVoltage,PartNumber,DeviceLocator,SMBIOSMemoryType)
-$pd=@(Get-PhysicalDisk | Select-Object FriendlyName,MediaType,BusType,Size)
-$snd=@(Get-CimInstance Win32_SoundDevice | Select-Object Name)
-$net=@(Get-CimInstance Win32_NetworkAdapter | Where-Object { $_.PhysicalAdapter -eq $true } | Select-Object Name,NetConnectionID)
-$mon=@(Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorID | ForEach-Object { [pscustomobject]@{ M=(-join [char[]]($_.ManufacturerName | Where-Object {$_ -ne 0})); N=(-join [char[]]($_.UserFriendlyName | Where-Object {$_ -ne 0})); C=(-join [char[]]($_.ProductCodeID | Where-Object {$_ -ne 0})) } })
-$dim=@(Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorBasicDisplayParams | Select-Object MaxHorizontalImageSize,MaxVerticalImageSize)
+
+# ⚠️ 性能铁律：每个 CIM 查询都必须带 -Property 白名单。
+#    实测（本机 Ryzen 5 5600XT / B450）：
+#      Get-CimInstance Win32_Processor | Select-Object ...      = 1022 ms（全属性物化 + 管道）
+#      Get-CimInstance Win32_Processor -Property NumberOfCores   =    7 ms   ← 慢 145 倍
+#    同理 Get-PhysicalDisk（cdxml 封装，会顺带查健康状态）= 1078~1550 ms，
+#    换成 MSFT_PhysicalDisk -Property = 23 ms。整段脚本因此从 3.6s 降到 0.7s。
+$os=Get-CimInstance Win32_OperatingSystem -Property Caption,Version,BuildNumber,OSArchitecture,LastBootUpTime
+$cs=Get-CimInstance Win32_ComputerSystem -Property Manufacturer,Model
+$bb=Get-CimInstance Win32_BaseBoard -Property Manufacturer,Product
+$bios=Get-CimInstance Win32_BIOS -Property Manufacturer,SMBIOSBIOSVersion
+$cpu=Get-CimInstance Win32_Processor -Property Name,NumberOfCores,NumberOfLogicalProcessors,MaxClockSpeed | Select-Object -First 1
+$gpu=@(Get-CimInstance Win32_VideoController -Property Name,DriverVersion,AdapterRAM,AdapterCompatibility | Select-Object Name,DriverVersion,AdapterRAM,AdapterCompatibility)
+$mem=@(Get-CimInstance Win32_PhysicalMemory -Property Manufacturer,Capacity,Speed,ConfiguredClockSpeed,ConfiguredVoltage,PartNumber,DeviceLocator,SMBIOSMemoryType | Select-Object Manufacturer,Capacity,Speed,ConfiguredClockSpeed,ConfiguredVoltage,PartNumber,DeviceLocator,SMBIOSMemoryType)
+$pd=@(Get-CimInstance -Namespace root\Microsoft\Windows\Storage -ClassName MSFT_PhysicalDisk -Property FriendlyName,MediaType,BusType,Size | Select-Object FriendlyName,MediaType,BusType,Size)
+$snd=@(Get-CimInstance Win32_SoundDevice -Property Name | Select-Object Name)
+$net=@(Get-CimInstance Win32_NetworkAdapter -Property Name,NetConnectionID,PhysicalAdapter | Where-Object { $_.PhysicalAdapter -eq $true } | Select-Object Name,NetConnectionID)
+$mon=@(Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorID -Property ManufacturerName,UserFriendlyName,ProductCodeID | ForEach-Object { [pscustomobject]@{ M=(-join [char[]]($_.ManufacturerName | Where-Object {$_ -ne 0})); N=(-join [char[]]($_.UserFriendlyName | Where-Object {$_ -ne 0})); C=(-join [char[]]($_.ProductCodeID | Where-Object {$_ -ne 0})) } })
+$dim=@(Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorBasicDisplayParams -Property MaxHorizontalImageSize,MaxVerticalImageSize | Select-Object MaxHorizontalImageSize,MaxVerticalImageSize)
 $gv=@(Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}\0*' | Where-Object { $_.DriverDesc } | Select-Object DriverDesc,@{n='VRAM';e={$_.'HardwareInformation.qwMemorySize'}})
-$up=[long]((Get-Date)-$os.LastBootUpTime).TotalSeconds
-[pscustomobject]@{ os=$os.Caption; ver=$os.Version; build=$os.BuildNumber; arch=$os.OSArchitecture; up=$up; csM=$cs.Manufacturer; csModel=$cs.Model; bbM=$bb.Manufacturer; bbP=$bb.Product; biosM=$bios.Manufacturer; biosV=$bios.SMBIOSBIOSVersion; cpuName=$cpu.Name; cpuCores=$cpu.NumberOfCores; cpuLog=$cpu.NumberOfLogicalProcessors; cpuMhz=$cpu.MaxClockSpeed; gpu=$gpu; gpuVram=$gv; mem=$mem; disks=$pd; sound=$snd; net=$net; mon=$mon; monDim=$dim } | ConvertTo-Json -Compress -Depth 4
+[pscustomobject]@{ os=$os.Caption; ver=$os.Version; build=$os.BuildNumber; arch=$os.OSArchitecture; csM=$cs.Manufacturer; csModel=$cs.Model; bbM=$bb.Manufacturer; bbP=$bb.Product; biosM=$bios.Manufacturer; biosV=$bios.SMBIOSBIOSVersion; cpuName=$cpu.Name; cpuCores=$cpu.NumberOfCores; cpuLog=$cpu.NumberOfLogicalProcessors; cpuMhz=$cpu.MaxClockSpeed; gpu=$gpu; gpuVram=$gv; mem=$mem; disks=$pd; sound=$snd; net=$net; mon=$mon; monDim=$dim } | ConvertTo-Json -Compress -Depth 4
 "#;
 
 /// 带超时的 PowerShell 执行（防 WMI 偶发挂起拖死线程池 → 界面"没反应"）
@@ -258,7 +266,9 @@ fn collect() -> HardwareInfo {
     info.memory.used_pct = used;
 
     let wmi = wmi_collect();
-    info.uptime_secs = js_u64(&wmi, "up");
+    // 运行时间统一用 GetTickCount64：缓存命中的分支也要能重算，
+    // 不能依赖「上一次 PS 采集时刻」推算（期间可能重启过）
+    info.uptime_secs = unsafe { GetTickCount64() } / 1000;
 
     // CPU（WMI 补核心数与频率）
     info.cpu.cores_physical = js_u64(&wmi, "cpuCores") as u32;
@@ -432,23 +442,169 @@ fn collect() -> HardwareInfo {
 // 失效条件：① 进程退出  ② 前端传 refresh=true（手动刷新/超过 30 分钟 TTL）
 static CACHE: Mutex<Option<HardwareInfo>> = Mutex::new(None);
 
+// ---------------- 磁盘缓存：让「每次启动」都秒开 ----------------
+//
+// 实测采集一次约 1.4~1.6s（PowerShell 进程启动 ~0.9s 无法避免），而硬件信息
+// 几乎不变（换内存条/显卡才会变）。所以把结果落到配置文件旁边：
+// 启动时先读文件立即渲染，再在后台重采一次覆盖 —— 用户不再对着空白等两秒。
+//
+// 关键：**动态字段不能沿用旧值**。可用内存、内存占用率、运行时间必须重算，
+// 否则界面会显示上一次启动时的数字（用户会以为数据不刷新）。
+
+#[derive(Serialize, Deserialize)]
+struct CachedHardware {
+    /// 保存时间（Unix 秒）
+    saved_at: u64,
+    info: HardwareInfo,
+}
+
+/// 超过这个时间就不再信任缓存，改为前台同步采集（可能换过硬件）
+const CACHE_MAX_AGE_SECS: u64 = 7 * 24 * 3600;
+/// 超过这个时间就顺手在后台刷新一次
+const CACHE_REFRESH_AFTER_SECS: u64 = 6 * 3600;
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn cache_path() -> Option<std::path::PathBuf> {
+    super::settings::config_dir().map(|d| d.join("hardware-cache.json"))
+}
+
+fn read_disk_cache() -> Option<CachedHardware> {
+    let txt = std::fs::read_to_string(cache_path()?).ok()?;
+    serde_json::from_str(&txt).ok()
+}
+
+fn write_disk_cache(info: &HardwareInfo) {
+    let Some(p) = cache_path() else { return };
+    let body = CachedHardware { saved_at: now_secs(), info: info.clone() };
+    if let Ok(txt) = serde_json::to_string(&body) {
+        let _ = std::fs::write(p, txt);
+    }
+}
+
+/// 重算每次都会变的字段（内存占用、运行时间）
+fn refresh_dynamic(info: &mut HardwareInfo) {
+    let (total, avail, used) = memory_from_api();
+    info.memory.total_bytes = total;
+    info.memory.available_bytes = avail;
+    info.memory.used_pct = used;
+    info.uptime_secs = unsafe { GetTickCount64() } / 1000;
+}
+
+static REFRESHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 后台重采一次并写回两级缓存；同一时刻只允许一个（避免连点刷新开多个 PS 进程）
+fn spawn_background_refresh() {
+    use std::sync::atomic::Ordering;
+    if REFRESHING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(|| {
+        let info = collect();
+        if let Ok(mut g) = CACHE.lock() {
+            *g = Some(info.clone());
+        }
+        write_disk_cache(&info);
+        REFRESHING.store(false, Ordering::SeqCst);
+    });
+}
+
 #[tauri::command]
 pub async fn get_hardware_info(refresh: Option<bool>) -> HardwareInfo {
     let force = refresh.unwrap_or(false);
     tauri::async_runtime::spawn_blocking(move || {
         if !force {
+            // ① 进程内缓存：本次运行已采过
             if let Ok(guard) = CACHE.lock() {
                 if let Some(ref data) = *guard {
-                    return data.clone(); // 命中缓存：零扫描，秒开
+                    return data.clone();
+                }
+            }
+            // ② 磁盘缓存：上次运行的采集结果，秒开
+            if let Some(mut c) = read_disk_cache() {
+                let age = now_secs().saturating_sub(c.saved_at);
+                if age < CACHE_MAX_AGE_SECS {
+                    refresh_dynamic(&mut c.info);
+                    if age > CACHE_REFRESH_AFTER_SECS {
+                        spawn_background_refresh();
+                    }
+                    return c.info;
                 }
             }
         }
+        // ③ 真采集（首次安装 / 手动刷新 / 缓存过期）
         let info = collect();
         if let Ok(mut guard) = CACHE.lock() {
             *guard = Some(info.clone());
         }
+        write_disk_cache(&info);
         info
     })
     .await
     .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 回归：`-Property` 白名单少写一个字段，会让对应信息静默变成空值。
+    /// 这个测试真跑一次采集，断言关键字段确实有内容。
+    #[test]
+    fn 采集结果关键字段完整() {
+        let started = Instant::now();
+        let info = collect();
+        println!("采集耗时 {}ms", started.elapsed().as_millis());
+        println!(
+            "CPU: {} / {}({}) MHz / {}C{}T",
+            info.cpu.name, info.cpu.base_mhz, info.cpu.base_mhz,
+            info.cpu.cores_physical, info.cpu.cores_logical
+        );
+        println!("系统: {} build {}", info.system.caption, info.system.build);
+        println!("主板: {} {}", info.motherboard.manufacturer, info.motherboard.product);
+        for d in &info.disks {
+            println!("磁盘: {} {} {} {}", d.model, d.media, d.bus, d.size_bytes);
+        }
+        for g in &info.gpu {
+            println!("显卡: {} {} VRAM={}", g.name, g.driver_version, g.vram_bytes);
+        }
+        println!("内存条: {} 根, 类型 {}", info.memory.sticks.len(), info.memory.mem_type);
+        println!("显示器: {}", info.monitors.len());
+        println!("网卡: {} 声卡: {}", info.network.len(), info.sound.len());
+
+        // 必须拿到的：CPU 型号与核心数、系统版本、磁盘型号与介质
+        assert!(!info.cpu.name.trim().is_empty(), "CPU 型号为空（-Property 漏字段？）");
+        assert!(info.cpu.cores_logical > 0, "逻辑核心数为 0");
+        assert!(!info.system.caption.is_empty(), "系统名称为空");
+        assert!(!info.system.build.is_empty(), "系统 build 号为空");
+        assert!(!info.disks.is_empty(), "没有读到物理磁盘");
+        assert!(
+            info.disks.iter().all(|d| !d.model.trim().is_empty()),
+            "磁盘型号为空"
+        );
+        assert!(
+            info.disks.iter().all(|d| !d.media.is_empty()),
+            "磁盘介质类型为空（MSFT_PhysicalDisk 的 MediaType 没读到？）"
+        );
+        assert!(!info.gpu.is_empty(), "没有读到显卡");
+        assert!(info.uptime_secs > 0, "运行时间为 0");
+    }
+
+    /// 磁盘缓存必须能无损往返（含中文、空数组等边界）
+    #[test]
+    fn 磁盘缓存序列化往返() {
+        let info = collect();
+        let body = CachedHardware { saved_at: now_secs(), info: info.clone() };
+        let txt = serde_json::to_string(&body).unwrap();
+        let back: CachedHardware = serde_json::from_str(&txt).unwrap();
+        assert_eq!(back.info.cpu.name, info.cpu.name);
+        assert_eq!(back.info.disks.len(), info.disks.len());
+        assert_eq!(back.info.memory.sticks.len(), info.memory.sticks.len());
+        assert_eq!(back.saved_at, body.saved_at);
+    }
 }

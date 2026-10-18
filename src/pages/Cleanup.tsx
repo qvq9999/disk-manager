@@ -3,7 +3,7 @@ import {
   Trash2, Lock, Check, Loader2, FileClock, Database, ScrollText,
   Code, FlaskConical, HardDrive, ChevronDown, ChevronRight, ScanSearch,
   Globe, MessageSquare, PlayCircle, Gamepad2, FileText, Download, PackageX,
-  RefreshCw, TrendingDown, AlertTriangle, Layers,
+  RefreshCw, TrendingDown, AlertTriangle, Layers, FolderMinus,
 } from 'lucide-react'
 import type { CleanCategory, Volume } from '../types'
 import {
@@ -11,6 +11,8 @@ import {
   peekCleanCategories, getLastCleanDrives, cleanFetchedAt,
 } from '../services/api'
 import { fmtBytes } from '../utils/format'
+import { InstallerClean } from './cleanup/InstallerClean'
+import { EmptyDirClean } from './cleanup/EmptyDirClean'
 
 /**
  * 页面状态机
@@ -49,7 +51,8 @@ function hhmm(ts: number | null): string {
   return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
 }
 
-export function Cleanup() {
+/** 垃圾扫描（原清理页主体）。外层 `Cleanup` 负责三个子功能的页签切换。 */
+function JunkScan() {
   // ---- 首次挂载：从会话缓存恢复，避免切页回来又变成空态、也不重复扫描 ----
   const boot = useMemo(() => {
     const scope = getLastCleanDrives()
@@ -315,7 +318,7 @@ export function Cleanup() {
   if (phase === 'idle' || phase === 'scanning') {
     const scanning = phase === 'scanning'
     return (
-      <div className='page-enter' style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+      <div className='page-enter' style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
         <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 20, padding: '24px 0' }}>
           <EmptyArt />
           <div style={{ textAlign: 'center' }}>
@@ -393,7 +396,7 @@ export function Cleanup() {
   // ---- 结果态 / 清理中 / 完成 ----
   const isDone = phase === 'done'
   return (
-    <div className='page-enter' style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+    <div className='page-enter' style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
       <div className='summary-bar'>
         <div>
           {/* 完成态显示「本次释放」而不是「已勾选」：避免刚清完又显示一大笔待删除量 */}
@@ -632,6 +635,62 @@ export function Cleanup() {
 
       {/* 说明：不再使用底部固定 toast —— 它会一直浮在列表上挡住内容，
           且与管理上方的「清理完成」摘要条信息重复 */}
+    </div>
+  )
+}
+
+/**
+ * 清理页容器：三个子功能平级放在页签里。
+ *
+ * 为什么拆成三个而不是塞进同一张列表：
+ *   · 「垃圾」是按规则/目录批量清，默认勾选；
+ *   · 「安装包」「空文件夹」是逐个文件由用户挑选，默认一个都不勾，删除也不可恢复。
+ *   混在一个列表里，很容易让用户误以为「安装包也默认选好了」。
+ */
+const TABS = [
+  { id: 'junk', label: '垃圾扫描', icon: Trash2, hint: '系统与环境垃圾，按规则批量清理' },
+  { id: 'installer', label: '安装包清理', icon: PackageX, hint: '你下载过的安装包，默认不勾选' },
+  { id: 'emptydir', label: '空文件夹', icon: FolderMinus, hint: '完全为空的目录，默认不勾选' },
+] as const
+
+type TabId = (typeof TABS)[number]['id']
+
+export function Cleanup() {
+  const [tab, setTab] = useState<TabId>('junk')
+  const active = TABS.find((t) => t.id === tab)!
+
+  return (
+    <div
+      className='page-enter'
+      style={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 }}
+    >
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 16, flexShrink: 0, flexWrap: 'wrap' }}>
+        <div className='filter-tabs'>
+          {TABS.map((t) => {
+            const Icon = t.icon
+            return (
+              <button
+                key={t.id}
+                className={`filter-tab${tab === t.id ? ' active' : ''}`}
+                onClick={() => setTab(t.id)}
+                title={t.hint}
+              >
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                  <Icon size={13} />
+                  {t.label}
+                </span>
+              </button>
+            )
+          })}
+        </div>
+        <span style={{ fontSize: 11.5, color: 'var(--meta)' }}>{active.hint}</span>
+      </div>
+
+      <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+        {tab === 'junk' && <JunkScan />}
+        {tab === 'installer' && <InstallerClean />}
+        {tab === 'emptydir' && <EmptyDirClean />}
+      </div>
     </div>
   )
 }

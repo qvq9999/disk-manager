@@ -68,6 +68,15 @@ fn is_known(a: &str) -> bool {
     a == CLOSE_ASK || a == CLOSE_BACKGROUND || a == CLOSE_EXIT
 }
 
+/// 配置文件所在目录：硬件缓存等「旁挂数据」复用同一位置，
+/// 避免在用户目录里再散落一个自建路径。
+pub fn config_dir() -> Option<PathBuf> {
+    SETTINGS_PATH
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().and_then(|p| p.parent().map(|d| d.to_path_buf())))
+}
+
 pub fn close_action() -> String {
     CLOSE_ACTION
         .lock()

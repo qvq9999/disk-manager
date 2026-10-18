@@ -59,7 +59,7 @@ pub struct CleanCategory {
 }
 
 /// 用户勾选的盘符；为空则回落到默认盘（C/D/E/F）
-fn effective_drives(drives: &[String]) -> Vec<char> {
+pub(crate) fn effective_drives(drives: &[String]) -> Vec<char> {
     let src: Vec<String> = if drives.is_empty() {
         ["C", "D", "E", "F"].iter().map(|s| s.to_string()).collect()
     } else {

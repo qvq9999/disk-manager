@@ -1,7 +1,7 @@
 // ============ 数据服务层（双模式） ============
 // Tauri 环境: invoke Rust 命令（真实数据）
 // 浏览器预览: 回落 Mock（与 Tauri 命令同契约）
-import type { Volume, FileNode, CleanCategory, InstalledApp, ResidualItem, HardwareInfo, PhysicalDisk, AppSettings, CloseAction } from '../types'
+import type { Volume, FileNode, CleanCategory, InstalledApp, ResidualItem, HardwareInfo, PhysicalDisk, AppSettings, CloseAction, InstallerItem, EmptyDirItem } from '../types'
 import { Channel } from '@tauri-apps/api/core'
 
 export const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
@@ -430,6 +430,115 @@ export async function runClean(
   })
 }
 
+// ---------------- 安装包专项清理 ----------------
+
+/** 浏览器预览用的假数据（真实环境走 Rust 扫描） */
+const mockInstallers: InstallerItem[] = [
+  { path: 'C:\\Users\\User\\Downloads\\WeChatSetup.exe', name: 'WeChatSetup.exe', size: 182 * 1024 ** 2, mtime: 1758000000, kind: 'EXE' },
+  { path: 'C:\\Users\\User\\Downloads\\VSCodeSetup-x64.exe', name: 'VSCodeSetup-x64.exe', size: 96 * 1024 ** 2, mtime: 1757000000, kind: 'EXE' },
+  { path: 'D:\\装机备份\\Office2019_x64.msi', name: 'Office2019_x64.msi', size: 1240 * 1024 ** 2, mtime: 1755000000, kind: 'MSI' },
+  { path: 'D:\\装机备份\\DriverBoostSetup.exe', name: 'DriverBoostSetup.exe', size: 310 * 1024 ** 2, mtime: 1753000000, kind: 'EXE' },
+]
+
+/** 扫描所选盘符下的安装包（.msi/.msix/.appx/.msu + 文件名含 setup/install 的 exe） */
+export async function scanInstallers(
+  drives: string[],
+  onProgress?: (p: { pct: number; current: string }) => void,
+): Promise<InstallerItem[]> {
+  if (!isTauri) {
+    return new Promise((resolve) => {
+      let p = 0
+      const timer = setInterval(() => {
+        p = Math.min(p + 20, 100)
+        onProgress?.({ pct: p, current: `正在扫描 ${drives[0] ?? 'C'}:\\…` })
+        if (p >= 100) {
+          clearInterval(timer)
+          resolve(mockInstallers)
+        }
+      }, 120)
+    })
+  }
+  const ch = new Channel<{ pct?: number; current?: string }>()
+  if (onProgress) ch.onmessage = (m) => onProgress({ pct: m.pct ?? 0, current: m.current ?? '' })
+  return inv<InstallerItem[]>('scan_installers', {
+    scope: drives.length > 0 ? { drives } : null,
+    onProgress: ch,
+  })
+}
+
+/** 让后端停止扫描（已扫到一半的结果不会返回，避免半成品列表） */
+export async function cancelInstallerScan(): Promise<void> {
+  if (!isTauri) return
+  try {
+    await inv<void>('cancel_installer_scan')
+  } catch { /* 可能刚好已结束 */ }
+}
+
+export async function deleteInstallers(
+  paths: string[],
+  onProgress?: (p: { pct: number; current: string; freed: number }) => void,
+): Promise<[number, number]> {
+  if (!isTauri) {
+    const total = mockInstallers.filter((i) => paths.includes(i.path)).reduce((s, i) => s + i.size, 0)
+    return [total, 0]
+  }
+  const ch = new Channel<{ pct?: number; current?: string; freed?: number }>()
+  if (onProgress) {
+    ch.onmessage = (m) => onProgress({ pct: m.pct ?? 0, current: m.current ?? '', freed: m.freed ?? 0 })
+  }
+  return inv<[number, number]>('delete_installers', { paths, onProgress: ch })
+}
+
+// ---------------- 空文件夹扫描 ----------------
+
+const mockEmptyDirs: EmptyDirItem[] = [
+  { path: 'C:\\Users\\User\\AppData\\Local\\Temp\\old-cache', name: 'old-cache', depth: 5, mtime: 1750000000 },
+  { path: 'D:\\Games\\Leftover\\Empty', name: 'Empty', depth: 3, mtime: 1749000000 },
+  { path: 'D:\\Backup\\2024\\截图', name: '截图', depth: 3, mtime: 1748000000 },
+]
+
+export async function scanEmptyDirs(
+  drives: string[],
+  onProgress?: (p: { pct: number; current: string }) => void,
+): Promise<EmptyDirItem[]> {
+  if (!isTauri) {
+    return new Promise((resolve) => {
+      let p = 0
+      const timer = setInterval(() => {
+        p = Math.min(p + 16, 100)
+        onProgress?.({ pct: p, current: `正在检查 ${drives[0] ?? 'C'}:\\…` })
+        if (p >= 100) {
+          clearInterval(timer)
+          resolve(mockEmptyDirs)
+        }
+      }, 110)
+    })
+  }
+  const ch = new Channel<{ pct?: number; current?: string }>()
+  if (onProgress) ch.onmessage = (m) => onProgress({ pct: m.pct ?? 0, current: m.current ?? '' })
+  return inv<EmptyDirItem[]>('scan_empty_dirs', {
+    scope: drives.length > 0 ? { drives } : null,
+    onProgress: ch,
+  })
+}
+
+export async function cancelEmptyDirScan(): Promise<void> {
+  if (!isTauri) return
+  try {
+    await inv<void>('cancel_empty_dir_scan')
+  } catch { /* 可能刚好已结束 */ }
+}
+
+export async function deleteEmptyDirs(
+  paths: string[],
+  onProgress?: (p: { pct: number; current: string }) => void,
+): Promise<[number, number]> {
+  if (!isTauri) return [paths.length, 0]
+  const ch = new Channel<{ pct?: number; current?: string }>()
+  if (onProgress) ch.onmessage = (m) => onProgress({ pct: m.pct ?? 0, current: m.current ?? '' })
+  return inv<[number, number]>('delete_empty_dirs', { paths, onProgress: ch })
+}
+
 export async function getInstalledApps(force = false): Promise<InstalledApp[]> {
   if (!isTauri) return mockApps
   return cached('apps', TTL.apps, () => inv<InstalledApp[]>('list_apps'), force)
@@ -632,7 +741,7 @@ function mockSettings(): AppSettings {
     autostart,
     // 预览环境没有真实托盘；这里给 true 只是为了让设置页能把完整交互渲染出来
     trayAvailable: true,
-    appVersion: '1.3.1',
+    appVersion: __APP_VERSION__,
     exePath: '（浏览器预览，无真实程序路径）',
   }
 }
