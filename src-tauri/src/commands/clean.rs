@@ -217,7 +217,8 @@ fn collect(drives: &[char], progress: Option<ProgressFn>) -> Vec<(Cat, CleanItem
                     .map(|c| c.to_ascii_uppercase().to_string()),
                 read_only: None,
                 warning: Some(format!(
-                    "疑似已卸载软件的残留目录：目录名未出现在已安装列表中，且最近 45 天无写入。共 {} 个文件。请确认该软件确已卸载后再勾选清理。",
+                    "疑似已卸载软件的残留目录：目录名未出现在已安装列表中，且最近 45 天无写入。共 {} 个文件。\
+                     ⚠️ 清理会删除**整个目录**，其中的配置与数据不会保留；请确认该软件确已卸载（且里面没有你要留的文件）后再勾选。",
                     od.files
                 )),
                 advanced: Some(true),

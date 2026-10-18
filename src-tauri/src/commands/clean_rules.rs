@@ -96,10 +96,19 @@ pub struct PathSpec {
     pub recurse: bool,
     /// REMOVESELF：删完文件后清理空的子目录
     pub remove_self: bool,
+    /// 是否启用「配置文件保护闸」（见 `protected_file`）。
+    /// 只对**整目录清空**类规则需要：像 UWP `LocalCache` 这种既是缓存又存应用数据的位置，
+    /// 不加闸会把 `.dbf`/`Roaming` 里的设置一起清掉。
+    pub protect: bool,
 }
 
 const fn fp(path: &'static str, pattern: &'static str, recurse: bool) -> PathSpec {
-    PathSpec { path, pattern, recurse, remove_self: false }
+    PathSpec { path, pattern, recurse, remove_self: false, protect: false }
+}
+
+/// 带配置文件保护闸的路径项（用于整目录清空且混有用户数据的场景）
+const fn fp_protect(path: &'static str, pattern: &'static str, recurse: bool) -> PathSpec {
+    PathSpec { path, pattern, recurse, remove_self: false, protect: true }
 }
 
 pub struct Rule {
@@ -467,9 +476,11 @@ pub static RULES: &[Rule] = &[
         exclude: EXCL_COMMON, default_on: true, advanced: false, warning: None, per_drive: false,
     },
     Rule {
-        id: "uwp.cache", name: "微软商店应用缓存", cat: Cat::System,
+        id: "uwp.cache", name: "微软商店应用缓存（保留应用设置）", cat: Cat::System,
         detect: &["%LOCALAPPDATA%\\Packages"],
-        paths: &[fp("%LOCALAPPDATA%\\Packages\\*\\LocalCache", "*.*", true)],
+        // ⚠️ LocalCache 既是缓存目录，也是 UWP 的 ApplicationData 之一：
+        //    其中 `Roaming` 存应用设置、`*.dbf` 是应用数据库，必须走保护闸
+        paths: &[fp_protect("%LOCALAPPDATA%\\Packages\\*\\LocalCache", "*.*", true)],
         exclude: EXCL_COMMON, default_on: true, advanced: false, warning: None, per_drive: false,
     },
     Rule {
@@ -756,6 +767,63 @@ pub fn expand_paths(raw: &str, drive: Option<char>) -> Vec<PathBuf> {
     bases
 }
 
+/// 配置文件保护闸：命中即跳过删除。
+///
+/// 背景（实测）：`%LOCALAPPDATA%\Packages\<包>\LocalCache` 是 UWP 的 ApplicationData
+/// 之一，里面既有可再生的缓存，也有 `Roaming`（应用设置）与 `.dbf` 数据库。
+/// 整目录清空会把应用设置一并抹掉，用户看到的就是「软件里的个人设置全没了」。
+///
+/// 判据刻意宽松（宁可少清几百 KB 缓存，也不能错删一份设置）：
+///   ① 相对路径中任一段叫 `Roaming` → 整枝保护（UWP 设置区）
+///   ② 扩展名属于配置/数据库类 → 保护
+///   ③ 文件名精确等于 Chromium profile 的关键文件 → 保护（兜底）
+const PROTECT_EXTS: &[&str] = &[
+    "ini", "cfg", "conf", "json", "xml", "yaml", "yml", "toml",
+    "db", "db3", "sqlite", "sqlite3", "dbf", "mdb",
+    "reg", "plist", "properties", "settings", "prefs", "dat",
+    "key", "pem", "pfx", "sav",
+];
+
+/// Chromium profile 的关键文件名（无扩展名，靠名字识别）
+const PROTECT_NAMES: &[&str] = &[
+    "login data", "cookies", "preferences", "secure preferences", "history",
+    "web data", "local state", "bookmarks", "top sites", "visited links",
+    "sync data", "affiliation database", "network action predictor",
+];
+
+/// `rel` 是被清理根目录下的相对路径（不是绝对路径）
+pub fn protected_file(rel: &Path) -> bool {
+    // ① Roaming 子树（UWP 应用设置）
+    for comp in rel.components() {
+        if comp.as_os_str().to_string_lossy().eq_ignore_ascii_case("roaming") {
+            return true;
+        }
+    }
+    // ② 配置 / 数据库类扩展名
+    let ext = rel
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    if !ext.is_empty() && PROTECT_EXTS.iter().any(|x| *x == ext) {
+        return true;
+    }
+    // ③ Chromium profile 关键文件（兜底）
+    let name = rel
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    PROTECT_NAMES.iter().any(|x| *x == name)
+}
+
+/// 单个文件是否因「配置文件保护闸」而跳过
+fn spec_protects(spec: &PathSpec, root: &Path, file: &Path) -> bool {
+    if !spec.protect {
+        return false;
+    }
+    let rel = file.strip_prefix(root).unwrap_or(file);
+    protected_file(rel)
+}
+
 fn is_excluded(path: &Path, extra: &[&str]) -> bool {
     for comp in path.components() {
         let name = comp.as_os_str().to_string_lossy();
@@ -801,6 +869,10 @@ pub fn scan_rule(rule: &Rule, drive: Option<char>) -> u64 {
                 if is_excluded(e.path(), rule.exclude) {
                     continue;
                 }
+                // 统计口径必须与删除口径一致，否则「显示 8MB、实际清 0B」
+                if spec_protects(spec, &root, e.path()) {
+                    continue;
+                }
                 if let Ok(m) = e.metadata() {
                     total += m.len();
                 }
@@ -841,6 +913,9 @@ pub fn delete_rule<F: FnMut(u64, &str)>(
                     continue;
                 }
                 if is_excluded(e.path(), rule.exclude) {
+                    continue;
+                }
+                if spec_protects(spec, &root, e.path()) {
                     continue;
                 }
                 files.push(e.path().to_path_buf());
@@ -1344,6 +1419,33 @@ fn scan_uninstall_residuals_impl(min_bytes: u64, min_files: usize, idle_secs: u6
     out.sort_by(|a, b| b.size.cmp(&a.size));
     out.truncate(60);
     out
+}
+
+#[cfg(test)]
+mod protect_tests {
+    use super::*;
+
+    #[test]
+    fn 配置文件与设置目录被保护() {
+        // UWP 设置区
+        assert!(protected_file(Path::new(r"Roaming\settings.json")));
+        assert!(protected_file(Path::new(r"roaming\anything")));
+        // 数据库 / 配置类扩展名
+        for f in ["cache.dbf", "config.json", "app.ini", "state.db", "prefs.xml", "x.dat"] {
+            assert!(protected_file(Path::new(f)), "{f} 应被保护");
+        }
+        // Chromium profile 关键文件（无扩展名）
+        for f in ["Login Data", "Preferences", "History", "Cookies", "Local State"] {
+            assert!(protected_file(Path::new(f)), "{f} 应被保护");
+        }
+    }
+
+    #[test]
+    fn 普通缓存文件不被保护() {
+        for f in ["data_0", "f_000001", "index", "Cache_Data\\f_000002", "blob.bin"] {
+            assert!(!protected_file(Path::new(f)), "{f} 不应被保护");
+        }
+    }
 }
 
 #[cfg(test)]

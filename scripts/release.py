@@ -22,6 +22,7 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
+from datetime import datetime
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONF = os.path.join(ROOT, 'src-tauri', 'tauri.conf.json')

@@ -247,7 +247,7 @@ export function Cleanup() {
     const confirmText =
       `将直接删除选中的 ${chosenItems.length} 类文件（共 ${fmtBytes(totalSel, 2)}），不进回收站且不可恢复。` +
       (hasAppCache
-        ? '\n\n其中「应用缓存」只清空缓存目录内的文件，目录本身保留；应用下次启动会自动重建（首次打开可能略慢）。'
+        ? '\n\n其中「应用缓存」只清空缓存目录内的文件，目录本身保留；应用下次启动会自动重建（首次打开可能略慢）。配置文件、登录数据与数据库会被自动跳过，个人设置不受影响。'
         : '') +
       '\n\n确定继续？'
     if (!window.confirm(confirmText)) {

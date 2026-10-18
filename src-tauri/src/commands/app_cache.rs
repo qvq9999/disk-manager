@@ -16,7 +16,15 @@
 
 use std::path::{Path, PathBuf};
 
+use super::clean_rules;
+
 /// 精确白名单：目录名（小写比较）必须完全等于其中之一才认定为缓存
+///
+/// ⚠️ 收录标准已经收紧过一次：**目录里只能有缓存，不能同时是应用的 profile**。
+///    `CefCache` 曾因「名字带 cache」被收录，实测（本机 NVIDIA App）它其实是一个完整的
+///    Chromium profile —— 内部有 `Login Data`(已存密码) / `Preferences`(全部设置) /
+///    `History` / `Network\Cookies`，整目录清空等于把该应用的登录态和设置全删掉。
+///    正确做法是不把它当缓存根，**继续下钻**去找里面的 `Cache` / `Code Cache` / `GPUCache`。
 const CACHE_NAMES: &[&str] = &[
     // Chromium / Electron 通用
     "cache",
@@ -27,13 +35,13 @@ const CACHE_NAMES: &[&str] = &[
     "media cache",
     "cachestorage",
     "component_crx_cache",
-    "cefcache",
     "dawncache",
     "dawngraphitecache",
     "dawnwebgpucache",
     "crashpad",
     // ⚠️ 刻意不含 blob_storage：它存放 IndexedDB 的二进制对象（可能是离线文档、
     //    上传中的文件），删掉会丢应用数据，不属于可再生的缓存
+    // ⚠️ 刻意不含 cefcache：见上，它是 CEF 的完整 profile 根目录
     // VS Code / Electron 派生
     "cacheddata",
     "cachedextensionvsixs",
@@ -41,7 +49,7 @@ const CACHE_NAMES: &[&str] = &[
     "dxcache",
     "glcache",
     "d3dscache",
-    // UWP 容器
+    // UWP 容器（删除时另有配置文件保护闸）
     "inetcache",
     "localcache",
     "tempstate",
@@ -76,6 +84,9 @@ const BLOCK_SEGS: &[&str] = &[
     "system volume information",
     "windowsapps",
     "windows\\system32",
+    // 认证令牌缓存：删了会触发 Microsoft 账号重新登录，体积却只有几百 KB
+    // —— 收益与代价不成比例，直接跳过（用户投诉过「清理后要重新登录」）
+    "tokenbroker",
 ];
 
 pub struct FoundCache {
@@ -130,6 +141,11 @@ fn dir_size(p: &Path) -> (u64, usize) {
         .filter_map(|e| e.ok())
     {
         if e.file_type().is_file() {
+            // 与 delete_contents 同口径：被保护闸拦下的文件不计入「可清理」
+            let rel = e.path().strip_prefix(p).unwrap_or(e.path());
+            if clean_rules::protected_file(rel) {
+                continue;
+            }
             if let Ok(m) = e.metadata() {
                 total += m.len();
                 files += 1;
@@ -264,6 +280,10 @@ pub fn path_allowed(p: &Path) -> bool {
 
 /// 只删目录内文件，保留目录本身与子目录结构。
 /// 应用会自行重建缓存文件；保留目录可避免个别应用因目录缺失报错。
+///
+/// ⚠️ 删除前逐文件过「配置文件保护闸」（`clean_rules::protected_file`）：
+///    `LocalCache` 这类目录里混着 UWP 设置（`Roaming`）与数据库（`*.dbf`），
+///    一律清空会让用户「软件里的个人设置全没了」。宁可少清一点缓存。
 pub fn delete_contents<F: FnMut(u64)>(dir: &Path, freed: &mut u64, failed: &mut u32, mut on_file: F) {
     if !path_allowed(dir) {
         *failed += 1;
@@ -276,6 +296,10 @@ pub fn delete_contents<F: FnMut(u64)>(dir: &Path, freed: &mut u64, failed: &mut 
         .filter_map(|e| e.ok())
     {
         if e.file_type().is_file() {
+            let rel = e.path().strip_prefix(dir).unwrap_or(e.path());
+            if clean_rules::protected_file(rel) {
+                continue; // 设置 / 数据库 / profile 文件：保留
+            }
             files.push(e.path().to_path_buf());
         }
     }
@@ -321,6 +345,81 @@ mod tests {
         assert!(!is_cache_name("MyCache"));
         assert!(!is_cache_name("Cache2"));
         assert!(!is_cache_name("WeChat Files"));
+    }
+
+    /// 回归：`CefCache` 是 CEF 的完整 profile（含 Login Data / Preferences / History），
+    /// 绝不能当成缓存根整目录清空；应继续下钻到它内部的真实缓存子目录。
+    #[test]
+    fn cef目录不下钻为缓存根() {
+        assert!(!is_cache_name("CefCache"), "CefCache 不得作为缓存根");
+        let Ok(local) = std::env::var("LOCALAPPDATA") else {
+            eprintln!("skip: 无 LOCALAPPDATA");
+            return;
+        };
+        let root = PathBuf::from(&local).join("__dm_cef_test__");
+        let _ = std::fs::remove_dir_all(&root);
+        let cef = root.join("App").join("CefCache");
+        let def = cef.join("Default");
+        std::fs::create_dir_all(def.join("Cache")).unwrap();
+        std::fs::create_dir_all(def.join("Code Cache")).unwrap();
+        std::fs::create_dir_all(def.join("Network")).unwrap();
+        std::fs::write(def.join("Login Data"), b"pw").unwrap();
+        std::fs::write(def.join("Preferences"), b"{}").unwrap();
+        std::fs::write(def.join("History"), b"h").unwrap();
+        std::fs::write(def.join("Network").join("Cookies"), b"c").unwrap();
+        std::fs::write(def.join("Cache").join("data_0"), b"cache").unwrap();
+
+        let mut dirs = Vec::new();
+        find_caches(&root, 0, 5, &mut dirs);
+        let names: Vec<String> = dirs
+            .iter()
+            .map(|d| d.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "Cache"),
+            "应找到 CefCache\\Default\\Cache，实际：{names:?}"
+        );
+        assert!(names.iter().any(|n| n == "Code Cache"), "应找到 Code Cache");
+        assert!(!names.iter().any(|n| n == "CefCache"), "CefCache 本身不得入选");
+
+        // 即便误选了 profile 根，删除端也必须保留登录/设置文件
+        for f in ["Login Data", "Preferences", "History", "Network/Cookies"] {
+            assert!(
+                clean_rules::protected_file(Path::new(f)),
+                "{f} 必须被保护闸拦下"
+            );
+        }
+        assert!(!clean_rules::protected_file(Path::new("data_0")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 回归：UWP `LocalCache` 里的 Roaming（设置）与 *.dbf（数据库）必须保留
+    #[test]
+    fn localcache保留设置与数据库() {
+        let Ok(local) = std::env::var("LOCALAPPDATA") else {
+            eprintln!("skip: 无 LOCALAPPDATA");
+            return;
+        };
+        let root = PathBuf::from(&local).join("__dm_lc_test__");
+        let _ = std::fs::remove_dir_all(&root);
+        let lc = root.join("Packages").join("Foo_8we").join("LocalCache");
+        std::fs::create_dir_all(lc.join("Roaming")).unwrap();
+        std::fs::write(lc.join("blob.bin"), vec![0u8; 1024]).unwrap();
+        std::fs::write(lc.join("cache.dbf"), b"db").unwrap();
+        std::fs::write(lc.join("Roaming").join("settings.dat"), b"s").unwrap();
+        std::fs::write(lc.join("Roaming").join("user.json"), b"{}").unwrap();
+
+        assert!(path_allowed(&lc), "该测试路径应被允许：{}", lc.display());
+        let mut freed = 0u64;
+        let mut failed = 0u32;
+        delete_contents(&lc, &mut freed, &mut failed, |_| {});
+
+        assert_eq!(freed, 1024, "只应删掉普通缓存文件");
+        assert!(lc.join("cache.dbf").is_file(), "数据库必须保留");
+        assert!(lc.join("Roaming").join("settings.dat").is_file(), "Roaming 必须保留");
+        assert!(lc.join("Roaming").join("user.json").is_file());
+        assert!(!lc.join("blob.bin").exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
