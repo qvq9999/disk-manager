@@ -176,11 +176,18 @@ fn collect(drives: &[char], progress: Option<ProgressFn>) -> Vec<(Cat, CleanItem
                     size: fc.size,
                     safe: true,
                     lock_reason: None,
-                    default_on: Some(true),
+                    // 显卡相关（NVIDIA / AMD / Intel 的 DXCache、GLCache、着色器预编译等）
+                    // **默认不勾**：它们装着游戏与创作软件的预加载内容，清了要重新编译，
+                    // 首次启动明显变慢。用户可手动勾选，但不能默认替用户做这个决定。
+                    default_on: Some(!fc.gpu),
                     drive: None,
                     read_only: None,
-                    warning: None,
-                    advanced: None,
+                    warning: if fc.gpu {
+                        Some("显卡相关缓存（着色器预编译 / 驱动预加载）：删除后游戏与创作软件首次启动会重新编译，可能明显变慢。默认不勾选。".to_string())
+                    } else {
+                        None
+                    },
+                    advanced: if fc.gpu { Some(true) } else { None },
                 },
             ));
         }

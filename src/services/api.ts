@@ -632,7 +632,7 @@ function mockSettings(): AppSettings {
     autostart,
     // 预览环境没有真实托盘；这里给 true 只是为了让设置页能把完整交互渲染出来
     trayAvailable: true,
-    appVersion: '1.3.0',
+    appVersion: '1.3.1',
     exePath: '（浏览器预览，无真实程序路径）',
   }
 }

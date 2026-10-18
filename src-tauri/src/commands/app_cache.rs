@@ -95,6 +95,39 @@ pub struct FoundCache {
     /// 该应用下发现的缓存目录（多个：Cache / Code Cache / GPUCache…）
     pub dirs: Vec<PathBuf>,
     pub size: u64,
+    /// 是否与显卡相关（着色器预编译 / 驱动预加载）
+    ///
+    /// 这类目录删了不会丢设置，但会让游戏与创作软件**首次启动重新编译着色器**，
+    /// 表现为明显卡顿和读盘。用户明确要求默认不勾，只作为可选项列出。
+    pub gpu: bool,
+}
+
+/// 显卡厂商与图形管线缓存关键词（按「路径段」匹配，不做整串包含）
+const GPU_SEGS: &[&str] = &[
+    "nvidia", "nvidia corporation", "amd", "ati", "radeon", "geforce",
+    "intel", "dxcache", "glcache", "d3dscache", "vulkan",
+];
+
+/// 单个路径段是否属于显卡相关
+fn seg_is_gpu(seg: &str) -> bool {
+    let s = seg.trim().to_lowercase();
+    GPU_SEGS.iter().any(|k| {
+        s == *k
+            || s.starts_with(&format!("{k} "))
+            || s.starts_with(&format!("{k}_"))
+            || s.starts_with(&format!("{k}-"))
+    })
+}
+
+/// 路径（任意一段）或应用名是否与显卡相关
+pub fn gpu_related(app: &str, dirs: &[PathBuf]) -> bool {
+    if seg_is_gpu(app) {
+        return true;
+    }
+    dirs.iter().any(|d| {
+        d.components()
+            .any(|c| seg_is_gpu(&c.as_os_str().to_string_lossy()))
+    })
 }
 
 fn low(s: &str) -> String {
@@ -245,7 +278,8 @@ fn push_found(out: &mut Vec<FoundCache>, app: String, dirs: Vec<PathBuf>, skip: 
     if size < 8 * 1024 * 1024 {
         return;
     }
-    out.push(FoundCache { app, dirs: kept, size });
+    let gpu = gpu_related(&app, &kept);
+    out.push(FoundCache { app, dirs: kept, size, gpu });
 }
 
 // ---------------- 删除端：每次都要重新过一遍安全闸 ----------------
@@ -334,6 +368,24 @@ fn clear_readonly(p: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 显卡相关缓存必须被识别出来（默认不勾），普通应用缓存不能被误判
+    #[test]
+    fn 显卡相关缓存被识别() {
+        let p = |s: &str| vec![PathBuf::from(s)];
+        assert!(gpu_related("NVIDIA", &p(r"C:\Users\x\AppData\Local\NVIDIA\DXCache")));
+        assert!(gpu_related("NVIDIA Corporation", &p(r"C:\x\NVIDIA App\CefCache\Default\GPUCache")));
+        assert!(gpu_related("AMD", &p(r"C:\x\AppData\Local\AMD\DxCache")));
+        assert!(gpu_related("Foo", &p(r"C:\x\AppData\Local\Foofoo\D3DSCache")));
+        assert!(gpu_related("Intel", &p(r"C:\x\AppData\Local\Intel\ShaderCache")));
+
+        // 普通应用不得误判
+        assert!(!gpu_related("Microsoft", &p(r"C:\x\AppData\Local\Microsoft\Edge\User Data\Default\Cache")));
+        assert!(!gpu_related("Steam", &p(r"C:\x\AppData\Local\Steam\htmlcache\Default\Cache")));
+        assert!(!gpu_related("Quwan", &p(r"C:\x\AppData\Roaming\Quwan\TTVoice\EBWebView\Default\Cache")));
+        // 名字里含 amd 但不是独立路径段的（如 "Pyramid"）不该命中
+        assert!(!gpu_related("Pyramid", &p(r"C:\x\AppData\Local\Pyramid\Cache")));
+    }
 
     #[test]
     fn 白名单精确匹配不做模糊() {

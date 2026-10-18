@@ -50,10 +50,28 @@ def read_version():
 
 
 def bump_version(v):
-    """1.1.0 -> 1.2.0（用户约定：每次 +0.1）"""
-    parts = v.split('.')
-    major, minor = int(parts[0]), int(parts[1])
-    return f'{major}.{minor + 1}.0'
+    """
+    用户约定的版本号规则：**十进制逐位进位**
+
+        1.3.0 -> 1.3.1
+        1.3.9 -> 1.4.0      （修订号满 9 进次版本）
+        1.9.9 -> 2.0.0      （次版本也满 9 进主版本）
+        2.0.0 -> 2.0.1
+
+    即每一位数字只取 0~9，满了就往前进一，不是单纯的 patch 无限递增。
+    """
+    parts = v.strip().split('.')
+    while len(parts) < 3:
+        parts.append('0')
+    major, minor, patch = int(parts[0]), int(parts[1]), int(parts[2])
+    patch += 1
+    if patch > 9:
+        patch = 0
+        minor += 1
+    if minor > 9:
+        minor = 0
+        major += 1
+    return f'{major}.{minor}.{patch}'
 
 
 def append_changelog(ver, notes):
