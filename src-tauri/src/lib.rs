@@ -7,6 +7,16 @@ use tauri::{Emitter, Manager, WindowEvent};
 
 use commands::settings::{CLOSE_BACKGROUND, CLOSE_EXIT, show_main};
 
+/// 窗口与托盘统一使用的图标（256px 源）。
+///
+/// 为什么不用 `app.default_window_icon()`：它取的是 `bundle.icon` 列表里第一个可解析的
+/// 图标 —— 也就是 `icons/32x32.png`。任务栏/托盘在 150% 缩放下会请求 40~48px，
+/// 系统只能把 32px 放大，边缘发虚；用户观感就是「图标好像还是旧的/糊的」。
+/// 这里直接用 256px 源，由系统按需缩放。
+fn app_icon() -> Option<tauri::image::Image<'static>> {
+    tauri::image::Image::from_bytes(include_bytes!("../icons/128x128@2x.png")).ok()
+}
+
 /// 创建系统托盘。失败不是致命错误：只是「退到后台」不可用，仍可正常关闭程序。
 fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "show", "显示主界面", true, None::<&str>)?;
@@ -18,8 +28,8 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .tooltip("存储管理 Disk Manager");
 
-    if let Some(icon) = app.default_window_icon() {
-        builder = builder.icon(icon.clone());
+    if let Some(icon) = app_icon().or_else(|| app.default_window_icon().cloned()) {
+        builder = builder.icon(icon);
     }
 
     builder
@@ -81,6 +91,15 @@ pub fn run() {
 
       if let Err(e) = build_tray(app.handle()) {
         log::warn!("托盘图标创建失败，将禁用「退到后台」选项：{e}");
+      }
+
+      // 显式给主窗口设置图标：任务栏与 Alt+Tab 用的是**窗口图标**（WM_SETICON），
+      // 不是 exe 里嵌的资源。覆盖安装后若沿用默认解析（32px 源），高 DPI 下会被放大发虚，
+      // 看起来像「没换图标」。这里用 256px 源让系统自己挑尺寸。
+      if let (Some(window), Some(icon)) = (app.get_webview_window("main"), app_icon()) {
+        if let Err(e) = window.set_icon(icon) {
+          log::warn!("设置窗口图标失败：{e}");
+        }
       }
 
       // 再次启动本程序时，把窗口调回前台
