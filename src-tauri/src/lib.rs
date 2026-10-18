@@ -160,6 +160,15 @@ pub fn run() {
       commands::settings::resolve_close,
       commands::settings::show_main_window,
       commands::update::update_endpoint,
+      commands::identify::identify_node,
+      commands::identify::reveal_in_explorer,
+      commands::identify::open_external,
+      commands::ai::ai_get_config,
+      commands::ai::ai_save_config,
+      commands::ai::ai_clear_key,
+      commands::ai::ai_test_connection,
+      commands::ai::ai_analyze,
+      commands::ai::ai_chat,
     ])
     .run(tauri::generate_context!())
     .expect("error while building tauri application");

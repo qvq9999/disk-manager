@@ -1,9 +1,11 @@
+pub mod ai;
 pub mod app_cache;
 pub mod clean;
 pub mod clean_rules;
 pub mod disk;
 pub mod emptydir;
 pub mod hardware;
+pub mod identify;
 pub mod installer;
 pub mod scan;
 pub mod settings;

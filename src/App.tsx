@@ -2,15 +2,18 @@ import { useEffect, useState } from 'react'
 import { Cpu, HardDrive, Trash2, Package, Sun, Moon, AlertTriangle, Menu, Settings as SettingsIcon } from 'lucide-react'
 import type { Page, Volume } from './types'
 import { getVolumes, peekVolumes, warmUp, isElevated, restartAsAdmin, onCloseRequested } from './services/api'
+import { installNativeShell } from './services/native'
 import { checkForUpdate, subscribeUpdate, latestUpdate } from './services/update'
 import { ErrorBoundary } from './components/ErrorBoundary'
 import { CloseConfirm } from './components/CloseConfirm'
+import { AiAssistant } from './components/AiAssistant'
 import { Hardware } from './pages/Hardware'
 import { Overview } from './pages/Overview'
 import { DriveDetail } from './pages/DriveDetail'
 import { Cleanup } from './pages/Cleanup'
 import { Uninstall } from './pages/Uninstall'
 import { Settings } from './pages/Settings'
+import { AiSettingsPage } from './components/AiSettings'
 
 const NAV: { id: Page; label: string; icon: typeof HardDrive }[] = [
   { id: 'hardware', label: '硬件信息', icon: Cpu },
@@ -27,6 +30,7 @@ const TITLES: Record<Page, string> = {
   clean: '垃圾清理',
   uninstall: '软件卸载',
   settings: '设置',
+  ai: 'AI 助手',
 }
 
 export default function App() {
@@ -43,6 +47,12 @@ export default function App() {
 
   useEffect(() => {
     return onCloseRequested(() => setClosePrompt(true))
+  }, [])
+
+  // 接管 WebView 的浏览器行为（右键菜单/刷新/缩放/拖放/外链），让它看起来是个原生程序。
+  // 必须在首帧后立刻装好：晚一步用户就可能已经右键看到「刷新」了。
+  useEffect(() => {
+    installNativeShell()
   }, [])
 
   // 自动检查更新：延迟 3 秒，不拖慢首屏，也避开开机时与其他程序抢网络。
@@ -113,10 +123,11 @@ export default function App() {
     switch (page) {
       case 'hardware': return <Hardware />
       case 'overview': return <Overview volumes={volumes} onOpenDrive={openDrive} />
-      case 'drive': return drive ? <DriveDetail volume={drive} onBack={() => setPage('overview')} /> : null
+      case 'drive': return drive ? <DriveDetail volume={drive} onBack={() => setPage('overview')} onGotoClean={() => setPage('clean')} /> : null
       case 'clean': return <Cleanup />
       case 'uninstall': return <Uninstall />
-      case 'settings': return <Settings />
+      case 'settings': return <Settings onOpenAi={() => setPage('ai')} />
+      case 'ai': return <AiSettingsPage onBack={() => setPage('settings')} />
     }
   })()
 
@@ -135,7 +146,7 @@ export default function App() {
         {NAV.map(({ id, label, icon: Icon }) => (
           <button
             key={id}
-            className={`nav-item${page === id ? ' active' : ''}`}
+            className={`nav-item${page === id || (id === 'settings' && page === 'ai') ? ' active' : ''}`}
             onClick={() => goto(id)}
             title={label}
           >
@@ -211,6 +222,13 @@ export default function App() {
       </main>
 
       {closePrompt && <CloseConfirm onCancel={() => setClosePrompt(false)} />}
+
+      {/* 全局 AI 助手：不占导航位，Ctrl+K 或点右下角圆球唤起 */}
+      <AiAssistant
+        pageTitle={TITLES[page]}
+        admin={admin}
+        onGotoSettings={() => setPage('settings')}
+      />
     </div>
   )
 }

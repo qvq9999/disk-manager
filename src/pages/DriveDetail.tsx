@@ -1,13 +1,21 @@
 import { useEffect, useMemo, useState } from 'react'
-import { ChevronRight, Folder, File as FileIcon, CornerLeftUp, RefreshCw, Square, AlertTriangle } from 'lucide-react'
+import type { MouseEvent as RMouseEvent } from 'react'
+import { ChevronRight, Folder, File as FileIcon, CornerLeftUp, RefreshCw, Square, AlertTriangle, X } from 'lucide-react'
 import type { Volume, FileNode, Category } from '../types'
-import { peekDriveTree } from '../services/api'
+import { peekDriveTree, revealInExplorer } from '../services/api'
+import { showContextMenu } from '../services/contextMenu'
 import { startScan, stopScan, isTaskRunning, getScanTask, markScanSeen, useScanTask } from '../services/scanTasks'
 import { fmtBytes } from '../utils/format'
 import { Treemap, TreemapLegend } from '../components/Treemap'
 import { ScanWaitCard } from '../components/ScanTask'
+import { WhatIsThis } from '../components/WhatIsThis'
 
-export function DriveDetail({ volume, onBack }: { volume: Volume; onBack: () => void }) {
+/** 拼绝对路径：盘根已带反斜杠，子项之间补一个 */
+function joinPath(base: string, name: string): string {
+  return base.endsWith('\\') ? `${base}${name}` : `${base}\\${name}`
+}
+
+export function DriveDetail({ volume, onBack, onGotoClean }: { volume: Volume; onBack: () => void; onGotoClean?: () => void }) {
   const letter = volume.letter.toUpperCase()
   // 扫描任务与组件生命周期解耦：离开本页不会中断，回到本页直接接上（含已完成的结果）
   const task = useScanTask(letter)
@@ -63,6 +71,10 @@ export function DriveDetail({ volume, onBack }: { volume: Volume; onBack: () => 
   }
 
   const curPath = [`${volume.letter}:\\`, ...path]
+  /** 当前浏览到的绝对路径（盘根形如 `C:\`） */
+  const absPath = path.length === 0
+    ? `${volume.letter.toUpperCase()}:\\`
+    : `${volume.letter.toUpperCase()}:\\${path.join('\\')}`
 
   const goUp = () => setPath((p) => p.slice(0, -1))
   const toggleCat = (c: Category) =>
@@ -74,6 +86,38 @@ export function DriveDetail({ volume, onBack }: { volume: Volume; onBack: () => 
 
   const listItems = [...(cur.children ?? [])].sort((a, b) => b.size - a.size)
   const canOpen = (n: FileNode) => n.kind === 'dir' && !!n.children && n.children.length > 0
+
+  const enter = (name: string) => {
+    setPicked(null)
+    setPath((p) => [...p, name])
+  }
+
+  /** 目录/文件行的右键菜单：全部是原生动作，没有一项来自浏览器 */
+  const onRowMenu = (e: RMouseEvent, node: FileNode) => {
+    e.preventDefault()
+    const target = joinPath(absPath, node.name)
+    const isDir = node.kind === 'dir'
+    showContextMenu(
+      [
+        isDir
+          ? { type: 'item', label: '打开这一层', onClick: () => enter(node.name) }
+          : { type: 'item', label: '这是什么', onClick: () => setPicked(node) },
+        { type: 'sep' },
+        {
+          type: 'item',
+          label: '复制路径',
+          onClick: () => {
+            void navigator.clipboard.writeText(target).catch(() => {
+              alert(`无法访问剪贴板，路径如下：\n${target}`)
+            })
+          },
+        },
+        { type: 'item', label: '在资源管理器中打开', onClick: () => void revealInExplorer(target) },
+      ],
+      e.clientX,
+      e.clientY,
+    )
+  }
 
   return (
     <div className="detail-layout page-enter">
@@ -96,7 +140,8 @@ export function DriveDetail({ volume, onBack }: { volume: Volume; onBack: () => 
               <button
                 key={c.name}
                 className={`folder-row${picked === c ? ' active' : ''}`}
-                onClick={() => (canOpen(c) ? setPath((p) => [...p, c.name]) : setPicked(c))}
+                onClick={() => (canOpen(c) ? enter(c.name) : setPicked(c))}
+                onContextMenu={(e) => onRowMenu(e, c)}
                 title={c.kind === 'dir' && !canOpen(c) ? '已到展示深度上限（体积已完整统计）' : undefined}
               >
                 <span className={`f-icon${c.kind === 'file' ? ' file' : ''}`}>
@@ -141,6 +186,25 @@ export function DriveDetail({ volume, onBack }: { volume: Volume; onBack: () => 
           </button>
           <span className="count">{fmtBytes(cur.size, 1)}</span>
         </div>
+
+        {/* 选中文件时给出明确出口：卡片此时看的是这个文件，不是当前目录 */}
+        {picked && (
+          <div className="what-picked">
+            <FileIcon size={12} />
+            <span className="what-picked-name" title={picked.name}>{picked.name}</span>
+            <span className="what-picked-size">{fmtBytes(picked.size, 1)}</span>
+            <button type="button" className="what-btn" onClick={() => setPicked(null)}>
+              <X size={11} /> 回到当前目录
+            </button>
+          </div>
+        )}
+
+        <WhatIsThis
+          path={picked ? joinPath(absPath, picked.name) : absPath}
+          kind={picked ? 'file' : 'dir'}
+          size={picked ? picked.size : cur.size}
+          onGotoClean={onGotoClean}
+        />
 
         {/* 重新扫描进行中：旧结果仍可浏览，同时给出进度与停止入口 */}
         {running && (
@@ -203,7 +267,7 @@ export function DriveDetail({ volume, onBack }: { volume: Volume; onBack: () => 
           hidden={hidden}
           onOpen={(name) => {
             const child = cur.children?.find((c) => c.name === name)
-            if (child && canOpen(child)) setPath((p) => [...p, name])
+            if (child && canOpen(child)) enter(name)
           }}
           onPickFile={setPicked}
         />

@@ -1,6 +1,7 @@
 // ============ 类型定义（与未来 Tauri 命令契约对齐） ============
 
-export type Page = 'hardware' | 'overview' | 'drive' | 'clean' | 'uninstall' | 'settings'
+// 'ai' 是设置的二级页，不出现在侧边栏导航里
+export type Page = 'hardware' | 'overview' | 'drive' | 'clean' | 'uninstall' | 'settings' | 'ai'
 
 /** 点窗口 ✕ 时的行为：每次询问 / 退到后台（托盘） / 直接关闭 */
 export type CloseAction = 'ask' | 'background' | 'exit'
@@ -216,4 +217,52 @@ export interface EmptyDirItem {
   name: string
   depth: number
   mtime: number
+}
+
+// ---- 「这是什么」本地识别 ----
+/** 判定档位：safe 可清理 / caution 有代价 / danger 不能删 / unknown 判不出来 */
+export type Verdict = 'safe' | 'caution' | 'danger' | 'unknown'
+
+export interface IdentifyResult {
+  /** 结论标题，如「Steam 游戏本体」 */
+  label: string
+  /** 2 确定 / 1 较可能 / 0 判不出来 */
+  confidence: 0 | 1 | 2
+  evidence: string[]
+  verdict: Verdict
+  /** 这是什么 */
+  what: string
+  /** 删了会怎样 */
+  consequence: string
+  source: 'local' | 'ai'
+  /** 供云端分析的摘要（不含文件内容） */
+  summary: string
+  actionHint: 'clean' | 'locate' | 'none'
+  /** 采样是否被截断 */
+  truncated: boolean
+}
+
+// ---- AI ----
+export interface AiAnalysis {
+  what: string
+  canDelete: Verdict
+  consequence: string
+  suggestion: string
+}
+
+export interface AiConfigPublic {
+  provider: string
+  baseUrl: string
+  model: string
+  enabled: boolean
+  hasKey: boolean
+  /** 形如 sk-…a1b2；内置额度时是「内置额度」 */
+  keyHint: string
+  /** 当前是否在用内置额度 */
+  isBuiltin: boolean
+}
+
+export interface AiMessage {
+  role: 'user' | 'assistant'
+  content: string
 }

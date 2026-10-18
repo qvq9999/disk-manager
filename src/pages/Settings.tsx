@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import {
   HardDrive, Power, LayoutGrid, Trash2, Package, Cpu, Check, AlertTriangle,
   Minimize2, LogOut, HelpCircle, FolderCog, RefreshCw, Loader2, Download,
-  ChevronDown, ChevronUp,
+  ChevronDown, ChevronUp, ChevronRight, Sparkles,
 } from 'lucide-react'
 import type { AppSettings, CloseAction } from '../types'
 import { getAppSettings, updateAutostart, updateCloseAction } from '../services/api'
@@ -95,7 +95,7 @@ const FEATURES = [
   { icon: Package, name: '软件卸载', desc: '卸载后扫描残留（注册表 / 服务 / 计划任务）' },
 ]
 
-export function Settings() {
+export function Settings({ onOpenAi }: { onOpenAi: () => void }) {
   const [s, setS] = useState<AppSettings | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
   const [autostartBusy, setAutostartBusy] = useState(false)
@@ -352,6 +352,24 @@ export function Settings() {
         </div>
       )}
 
+      {/* ---------- AI 助手（点进二级页配置） ---------- */}
+      <div className="section-label">AI 助手</div>
+      <div className="panel" style={{ marginBottom: 20 }}>
+        <button type="button" className="ai-entry" onClick={onOpenAi}>
+          <span className="ai-entry-icon"><Sparkles size={16} /></span>
+          <span className="ai-entry-body">
+            <span className="ai-entry-title">AI 助手</span>
+            <span className="ai-entry-desc">
+              内置额度默认可用，也可以换成自己的 Key 或本地 Ollama。
+              空间分析的「AI 深度分析」与右下角问答都用这里的配置。
+            </span>
+          </span>
+          <span className="ai-entry-go">
+            配置 <ChevronRight size={13} />
+          </span>
+        </button>
+      </div>
+
       {/* ---------- 软件更新 ---------- */}
       <div className="section-label">软件更新</div>
       <div className="panel">
@@ -503,7 +521,7 @@ export function Settings() {
         <Row title="程序位置" desc={<span className="mono" style={{ wordBreak: 'break-all' }}>{s.exePath || '未知'}</span>}>
           <span />
         </Row>
-        <Row title="数据与隐私" desc="所有磁盘、注册表与软件信息均在本机读取，不上传、不联网请求。" last>
+        <Row title="数据与隐私" desc="磁盘、注册表与软件信息全部在本机读取。只有你主动使用 AI 功能时，才会把路径、体积、扩展名分布这类摘要发给你选择的服务商，不含任何文件内容。" last>
           <span />
         </Row>
       </div>

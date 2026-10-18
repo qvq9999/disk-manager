@@ -1,7 +1,7 @@
 // ============ 数据服务层（双模式） ============
 // Tauri 环境: invoke Rust 命令（真实数据）
 // 浏览器预览: 回落 Mock（与 Tauri 命令同契约）
-import type { Volume, FileNode, CleanCategory, InstalledApp, ResidualItem, HardwareInfo, PhysicalDisk, AppSettings, CloseAction, InstallerItem, EmptyDirItem } from '../types'
+import type { Volume, FileNode, CleanCategory, InstalledApp, ResidualItem, HardwareInfo, PhysicalDisk, AppSettings, CloseAction, InstallerItem, EmptyDirItem, IdentifyResult, AiAnalysis, AiConfigPublic, AiMessage } from '../types'
 import { Channel } from '@tauri-apps/api/core'
 
 export const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
@@ -805,4 +805,184 @@ export function onCloseRequested(cb: () => void): () => void {
     disposed = true
     unlisten?.()
   }
+}
+
+// ---------------- 「这是什么」本地识别 ----------------
+//
+// 结果按路径缓存：同一个目录反复点开不重复扫盘。
+// 注意缓存不过期是**有意**的 —— 识别结论来自路径特征与文件头，短时间内不会变；
+// 用户真想重算就刷新页面。缓存上限 300 条，防止长时间浏览把内存撑大。
+
+const identifyCache = new Map<string, IdentifyResult>()
+
+export async function identifyNode(path: string, kind: 'dir' | 'file', size: number): Promise<IdentifyResult> {
+  const key = `${kind}:${path}`
+  const hit = identifyCache.get(key)
+  if (hit) return hit
+
+  const result = isTauri
+    ? await inv<IdentifyResult>('identify_node', { path, kind, size })
+    : mockIdentify(path, kind, size)
+
+  if (identifyCache.size > 300) {
+    const first = identifyCache.keys().next().value
+    if (first) identifyCache.delete(first)
+  }
+  identifyCache.set(key, result)
+  return result
+}
+
+/** 预览环境：只按路径里最明显的几个特征给结论，够把界面跑通 */
+function mockIdentify(path: string, kind: 'dir' | 'file', size: number): IdentifyResult {
+  const p = path.toLowerCase()
+  const mk = (
+    label: string, verdict: IdentifyResult['verdict'], what: string, consequence: string, conf: 0 | 1 | 2 = 2,
+  ): IdentifyResult => ({
+    label, confidence: conf, verdict, what, consequence,
+    evidence: ['（浏览器预览：模拟判定）'], source: 'local', summary: '', actionHint: verdict === 'safe' ? 'clean' : 'none', truncated: false,
+  })
+
+  if (kind === 'file') {
+    const fn = path.split(/[\\/]/).pop()?.toLowerCase() ?? ''
+    if (fn === 'pagefile.sys') {
+      return mk('系统页面文件（虚拟内存）', 'danger', 'Windows 把内存里暂时不用的数据换到这里的磁盘文件', '不能删除。删了会失去虚拟内存、大程序容易崩。要调整大小请到「系统属性 - 高级 - 性能 - 虚拟内存」里改。')
+    }
+    if (fn === 'hiberfil.sys') {
+      return mk('休眠文件', 'danger', '休眠时把整个内存内容写到磁盘，用于快速恢复现场', '不能直接删。不用休眠的话，可在管理员命令行执行 powercfg -h off 回收空间。')
+    }
+    const ext = fn.includes('.') ? fn.split('.').pop() ?? '' : ''
+    return mk(`${ext || '未知'} 文件`, 'caution', '一个普通文件', '删前确认路径与用途。', 1)
+  }
+  if (/^[a-z]:\\?$/i.test(path)) {
+    const sys = path.toLowerCase().startsWith('c:')
+    return mk(
+      sys ? '系统盘根目录' : '分区根目录',
+      'caution',
+      sys ? 'Windows 所在的分区根目录，系统、程序与用户数据都在它下面' : '这个分区的顶层目录',
+      '根目录本身不能整体处理，展开到子目录逐个判断。',
+    )
+  }
+  if (p.includes('steamapps')) return mk('Steam 游戏本体', 'danger', 'Steam 下载安装的游戏文件', '删了要重新下载几十 GB。')
+  if (p.includes('node_modules')) return mk('Node.js 项目依赖', 'safe', 'npm / pnpm / yarn 安装的第三方包', '可安全删除，重新装依赖即可恢复。')
+  if (p.includes('temp')) return mk('临时文件', 'safe', '程序运行时的临时文件', '可以删，被占用的会自动跳过。')
+  if (p.includes('node_modules') || p.includes('cache')) return mk('缓存目录', 'safe', '应用缓存', '可以删，下次启动会重新生成。')
+  return mk('普通文件夹', 'unknown', '没有命中已知特征', '判不出来它属于什么用途，删前请展开确认。', 0)
+}
+
+/** 在资源管理器中定位（真实窗口操作，不是网页行为） */
+export async function revealInExplorer(path: string): Promise<void> {
+  if (!isTauri) return
+  await inv<void>('reveal_in_explorer', { path })
+}
+
+/** 用系统默认浏览器打开链接 */
+export async function openExternal(url: string): Promise<void> {
+  if (!isTauri) {
+    window.open(url, '_blank', 'noopener,noreferrer')
+    return
+  }
+  await inv<void>('open_external', { url })
+}
+
+// ---------------- AI ----------------
+
+const MOCK_AI_KEY = 'dm.mock.ai'
+
+const MOCK_BUILTIN: AiConfigPublic = {
+  provider: 'builtin',
+  baseUrl: 'https://api.agnes-ai.cn/v1',
+  model: 'agnes-3.0-flash',
+  enabled: true,
+  hasKey: true,
+  keyHint: '内置额度',
+  isBuiltin: true,
+}
+
+function mockAiConfig(): AiConfigPublic {
+  try {
+    const raw = localStorage.getItem(MOCK_AI_KEY)
+    if (raw) return { ...MOCK_BUILTIN, ...(JSON.parse(raw) as Partial<AiConfigPublic>) }
+  } catch { /* 忽略 */ }
+  return MOCK_BUILTIN
+}
+
+export async function aiGetConfig(): Promise<AiConfigPublic> {
+  if (!isTauri) return mockAiConfig()
+  return inv<AiConfigPublic>('ai_get_config')
+}
+
+export async function aiSaveConfig(patch: {
+  provider: string
+  baseUrl: string
+  model: string
+  enabled: boolean
+  /** 传 undefined 表示不修改已保存的 Key；传空串表示清除 */
+  apiKey?: string
+}): Promise<AiConfigPublic> {
+  if (!isTauri) {
+    const prev = mockAiConfig()
+    const builtin = patch.provider === 'builtin'
+    const next: AiConfigPublic = {
+      provider: patch.provider,
+      baseUrl: patch.baseUrl,
+      model: patch.model,
+      enabled: patch.enabled,
+      hasKey: builtin ? true : patch.apiKey === undefined ? prev.hasKey : patch.apiKey.length > 0,
+      keyHint: builtin ? '内置额度' : prev.keyHint,
+      isBuiltin: builtin,
+    }
+    try { localStorage.setItem(MOCK_AI_KEY, JSON.stringify(next)) } catch { /* 忽略 */ }
+    return next
+  }
+  return inv<AiConfigPublic>('ai_save_config', {
+    provider: patch.provider,
+    baseUrl: patch.baseUrl,
+    model: patch.model,
+    enabled: patch.enabled,
+    apiKey: patch.apiKey ?? null,
+  })
+}
+
+export async function aiClearKey(): Promise<AiConfigPublic> {
+  if (!isTauri) {
+    try { localStorage.removeItem(MOCK_AI_KEY) } catch { /* 忽略 */ }
+    return mockAiConfig()
+  }
+  return inv<AiConfigPublic>('ai_clear_key')
+}
+
+export async function aiTestConnection(baseUrl: string, model: string, apiKey?: string): Promise<string> {
+  if (!isTauri) {
+    await new Promise((r) => setTimeout(r, 600))
+    return '（浏览器预览：模拟连接成功）'
+  }
+  return inv<string>('ai_test_connection', { baseUrl, model, apiKey: apiKey ?? null })
+}
+
+export async function aiAnalyze(req: {
+  path: string
+  kind: 'dir' | 'file'
+  size: number
+  summary: string
+  localLabel: string
+  localVerdict: string
+}): Promise<AiAnalysis> {
+  if (!isTauri) {
+    await new Promise((r) => setTimeout(r, 700))
+    return {
+      what: '（浏览器预览的模拟结果）这个目录看起来像某个软件的本地数据。',
+      canDelete: 'caution',
+      consequence: '删掉之后该软件的登录状态与个人设置可能会丢失。',
+      suggestion: '建议先用该软件自带的清理功能，不要直接删目录。',
+    }
+  }
+  return inv<AiAnalysis>('ai_analyze', { req })
+}
+
+export async function aiChat(messages: AiMessage[], context: string): Promise<string> {
+  if (!isTauri) {
+    await new Promise((r) => setTimeout(r, 600))
+    return '（浏览器预览环境没有真实模型）当前问题没有命中本地问答库。配置 AI 后可以问更复杂的问题。'
+  }
+  return inv<string>('ai_chat', { messages, context })
 }
