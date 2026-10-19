@@ -131,4 +131,40 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&base);
     }
+
+    /// 真实拉一次更新清单，确认「更新源在这台机器上真的能通」。
+    ///
+    /// 默认跳过（需要联网）。手动跑：
+    ///   cargo test --release --lib update::tests::更新源可访问 -- --include-ignored --nocapture
+    ///
+    /// 刻意 `no_proxy()`：程序从资源管理器启动时拿不到任何代理环境变量，
+    /// 走环境代理跑通不代表用户那边能通。这条测的就是「裸连」。
+    #[test]
+    #[ignore = "需要联网"]
+    fn 更新源可访问且返回合法清单() {
+        let url = ENDPOINT.to_string();
+        let body = tauri::async_runtime::block_on(async move {
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .no_proxy()
+                .user_agent("disk-manager/update-probe")
+                .build()
+                .expect("构建 HTTP 客户端失败");
+            let resp = client.get(&url).send().await.expect("请求更新源失败");
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            assert!(status.is_success(), "更新源返回 {status}：{}", &text[..text.len().min(200)]);
+            text
+        });
+
+        let v: serde_json::Value = serde_json::from_str(&body).expect("清单必须是 JSON");
+        assert!(v.get("version").is_some(), "清单缺少 version 字段");
+        let sig = &v["platforms"]["windows-x86_64"]["signature"];
+        assert!(sig.is_string(), "清单缺少签名，自动更新会被拒绝");
+        eprintln!(
+            "更新源可用：version={} 签名长度={}",
+            v["version"],
+            sig.as_str().unwrap_or("").len()
+        );
+    }
 }
