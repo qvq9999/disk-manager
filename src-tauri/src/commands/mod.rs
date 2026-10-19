@@ -1,8 +1,10 @@
 pub mod ai;
+pub mod ai_knowledge;
 pub mod app_cache;
 pub mod clean;
 pub mod clean_rules;
 pub mod disk;
+pub mod dupes;
 pub mod emptydir;
 pub mod fsx;
 pub mod hardware;

@@ -3,7 +3,7 @@ import {
   ArrowLeft, Sparkles, Check, AlertTriangle, Loader2, KeyRound, Server, ShieldCheck,
 } from 'lucide-react'
 import type { AiConfigPublic } from '../types'
-import { aiClearKey, aiGetConfig, aiSaveConfig, aiTestConnection } from '../services/api'
+import { aiGetConfig, aiSaveConfig, aiTestConnection } from '../services/api'
 
 interface Preset {
   id: string
@@ -127,6 +127,9 @@ export function AiSettingsPage({ onBack }: { onBack: () => void }) {
   const [model, setModel] = useState('')
   const [keyInput, setKeyInput] = useState('')
 
+  // 只保留「称呼」——自定义指令与背景知识已移除（用的人少，且提示词越长越容易跑偏）
+  const [assistantName, setAssistantName] = useState('')
+
   const [busy, setBusy] = useState<'save' | 'test' | 'reset' | null>(null)
   const [msg, setMsg] = useState<{ tone: 'ok' | 'bad'; text: string } | null>(null)
 
@@ -137,6 +140,7 @@ export function AiSettingsPage({ onBack }: { onBack: () => void }) {
         if (!alive) return
         setCfg(c)
         setEnabled(c.enabled)
+        setAssistantName(c.assistantName ?? '')
         if (c.isBuiltin) {
           setMode('builtin')
           setBuiltinModel(pickBuiltinModel(c.model))
@@ -168,13 +172,17 @@ export function AiSettingsPage({ onBack }: { onBack: () => void }) {
     setMsg(null)
     try {
       const next = mode === 'builtin'
-        ? await aiSaveConfig({ provider: 'builtin', baseUrl: '', model: builtinModel, enabled })
+        ? await aiSaveConfig({
+            provider: 'builtin', baseUrl: '', model: builtinModel, enabled,
+            assistantName: assistantName.trim(),
+          })
         : await aiSaveConfig({
             provider,
             baseUrl,
             model,
             enabled,
             apiKey: keyInput.trim() ? keyInput.trim() : undefined,
+            assistantName: assistantName.trim(),
           })
       setCfg(next)
       setKeyInput('')
@@ -195,26 +203,6 @@ export function AiSettingsPage({ onBack }: { onBack: () => void }) {
         ? await aiTestConnection('', builtinModel)
         : await aiTestConnection(baseUrl, model, keyInput.trim() || undefined)
       setMsg({ tone: 'ok', text: r })
-    } catch (e) {
-      setMsg({ tone: 'bad', text: String((e as { message?: string })?.message ?? e) })
-    } finally {
-      setBusy(null)
-    }
-  }
-
-  const resetToBuiltin = async () => {
-    if (busy) return
-    if (!confirm('将清除已保存的 API Key 并切回内置额度。继续吗？')) return
-    setBusy('reset')
-    setMsg(null)
-    try {
-      const next = await aiClearKey()
-      setCfg(next)
-      setMode('builtin')
-      setBuiltinModel(pickBuiltinModel(next.model))
-      setKeyInput('')
-      setEnabled(true)
-      setMsg({ tone: 'ok', text: '已切回内置额度' })
     } catch (e) {
       setMsg({ tone: 'bad', text: String((e as { message?: string })?.message ?? e) })
     } finally {
@@ -423,6 +411,20 @@ export function AiSettingsPage({ onBack }: { onBack: () => void }) {
         </>
       )}
 
+      {/* 助手称呼：与用哪种模型无关，始终可见 */}
+      <div className="section-label">助手</div>
+      <div className="panel" style={{ marginBottom: 18 }}>
+        <Field title="称呼" desc="你希望怎么称呼它。留空就是「AI 助手」。">
+          <input
+            value={assistantName}
+            onChange={(e) => setAssistantName(e.target.value)}
+            placeholder="AI 助手"
+            maxLength={20}
+            style={inputStyle}
+          />
+        </Field>
+      </div>
+
       {/* 操作区 */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 12 }}>
         <button className="btn btn-primary" style={{ padding: '7px 16px', fontSize: 12.5 }} onClick={() => void save()} disabled={!!busy}>
@@ -436,16 +438,6 @@ export function AiSettingsPage({ onBack }: { onBack: () => void }) {
         >
           {busy === 'test' ? <><Loader2 size={13} className="spin" /> 连接中…</> : '测试连接'}
         </button>
-        {mode === 'custom' && (
-          <button
-            className="btn btn-ghost"
-            style={{ padding: '7px 12px', fontSize: 12.5, marginLeft: 'auto', color: 'var(--danger)' }}
-            onClick={() => void resetToBuiltin()}
-            disabled={!!busy}
-          >
-            切回内置额度
-          </button>
-        )}
       </div>
 
       {msg && (

@@ -525,6 +525,16 @@ fn scan_via_mft(letter: &str) -> Result<FileNode, String> {
     )
     .ok_or_else(|| SCAN_CANCELLED.to_string())?;
 
+    // 孤儿检查：父目录那条记录没解析出来（校验失败/被跳过）时，
+    // 它下面的整棵子树会凭空消失 —— 用户看到的就是「某个文件夹的内容和大小都不对」。
+    // 这里把这些"找不到爹"的条目统计出来，占比明显就宁可回退慢路径。
+    let (orphan_entries, orphan_bytes) = orphan_stats(&entries);
+    if orphan_bytes > 1024 * 1024 * 1024 || orphan_bytes * 200 > node.size.max(1) {
+        return Err(format!(
+            "{orphan_entries} 个目录项找不到父目录（合计 {orphan_bytes} 字节），已回退到遍历"
+        ));
+    }
+
     // 合理性自检：MFT 解析一旦偏移写错，算出来的总量会离谱到几个数量级。
     // 用「卷已用字节数」当尺子，落在合理区间才采信，否则退回遍历。
     //
@@ -648,6 +658,26 @@ fn mft_subtree_size(
 
 fn fmt_unix(secs: u64) -> String {
     fmt_time(&(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs)))
+}
+
+/// 统计"父目录不存在"的条目：父 id 既不是根，也不在任何已解析记录里。
+///
+/// 这些条目不参与建树，体积会被静默丢掉 —— 所以必须把它们当异常信号暴露出来。
+fn orphan_stats(entries: &[super::mft::MftEntry]) -> (usize, u64) {
+    let mut known = std::collections::HashSet::with_capacity(entries.len());
+    for e in entries {
+        known.insert(e.id);
+    }
+    let root = super::mft::root_id();
+    let mut n = 0usize;
+    let mut bytes = 0u64;
+    for e in entries {
+        if e.parent != root && !known.contains(&e.parent) {
+            n += 1;
+            bytes += e.size;
+        }
+    }
+    (n, bytes)
 }
 
 #[cfg(test)]
@@ -874,6 +904,43 @@ mod tests {
         reset_progress();
     }
 
+
+    /// 逐目录对账：MFT 建出来的树里，每个顶层目录的体积/条目数 与真实遍历是否一致。
+    ///
+    /// 整盘总量对上不代表每个目录都对（一个目录多算、另一个少算可以互相抵消）。
+    /// 用户反馈"文件夹内容和大小不对"，就需要这一层对账：
+    ///   cargo test --release --lib 诊断逐目录体积 -- --ignored --nocapture
+    #[test]
+    #[ignore = "需要管理员权限 + 真实 NTFS 盘"]
+    fn 诊断逐目录体积() {
+        let letter = std::env::var("DM_MFT_TEST_DRIVE").unwrap_or_else(|_| "C".into());
+        let letter = letter.trim_end_matches(':').to_uppercase();
+        let mft = match scan_via_mft(&letter) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("skip: MFT 不可用（{e}）");
+                return;
+            }
+        };
+        let kids = mft.children.clone().unwrap_or_default();
+        println!("\n{:<28} {:>14} {:>14} {:>7}", "目录", "MFT", "遍历", "偏差");
+        for c in kids.iter().filter(|n| n.kind == "dir").take(12) {
+            let full = format!("{letter}:\\{}", c.name);
+            let Some(real) = dir_size_full(&PathBuf::from(&full)) else {
+                println!("{:<28} {:>14} {:>14}   （遍历失败）", c.name, c.size, 0);
+                continue;
+            };
+            let diff = if real == 0 { 0.0 } else { c.size as f64 / real as f64 };
+            println!(
+                "{:<28} {:>14} {:>14} {:>7.3}",
+                c.name.chars().take(26).collect::<String>(),
+                c.size,
+                real,
+                diff
+            );
+        }
+    }
+
     /// MFT 快速路径必须与遍历结果对得上。
     ///
     /// 需要管理员权限（读 $MFT 要打开卷设备），非管理员会直接 skip：
@@ -937,5 +1004,28 @@ mod tests {
         assert!(ratio > 0.97, "MFT 比遍历小 {:.1}%，疑似漏解析", (1.0 - ratio) * 100.0);
         assert!(ratio < 1.15, "MFT 比遍历大 {:.1}%，疑似重复计数", (ratio - 1.0) * 100.0);
         assert!(md * 2 > wd, "MFT 目录数 {md} 远少于遍历 {wd}");
+    }
+
+    #[test]
+    fn 孤儿条目会被统计出来() {
+        use super::super::mft::{root_id, MftEntry};
+        let e = |id: u64, parent: u64, size: u64| MftEntry {
+            id,
+            parent,
+            name: format!("n{id}"),
+            size,
+            is_dir: false,
+            mtime: 0,
+        };
+        // 正常：根 → 100（目录）→ 101
+        let normal = vec![
+            MftEntry { id: 100, parent: root_id(), name: "d".into(), size: 0, is_dir: true, mtime: 0 },
+            e(101, 100, 500),
+        ];
+        assert_eq!(orphan_stats(&normal), (0, 0));
+
+        // 异常：102 的父是 999，而 999 压根没解析出来
+        let broken = vec![e(102, 999, 4096)];
+        assert_eq!(orphan_stats(&broken), (1, 4096), "找不到父目录的条目必须被识别");
     }
 }

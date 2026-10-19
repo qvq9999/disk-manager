@@ -1,3 +1,4 @@
+mod app_meta;
 mod commands;
 mod instance;
 
@@ -142,6 +143,9 @@ pub fn run() {
       commands::installer::cancel_installer_scan,
       commands::installer::delete_installers,
       commands::emptydir::scan_empty_dirs,
+      commands::dupes::find_duplicates,
+      commands::dupes::cancel_dupes,
+      commands::dupes::delete_duplicates,
       commands::emptydir::cancel_empty_dir_scan,
       commands::emptydir::delete_empty_dirs,
       commands::uninstall::list_apps,
@@ -169,7 +173,6 @@ pub fn run() {
       commands::identify::open_external,
       commands::ai::ai_get_config,
       commands::ai::ai_save_config,
-      commands::ai::ai_clear_key,
       commands::ai::ai_test_connection,
       commands::ai::ai_analyze,
       commands::ai::ai_chat,

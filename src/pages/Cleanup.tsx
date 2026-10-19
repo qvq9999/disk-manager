@@ -3,7 +3,7 @@ import {
   Trash2, Lock, Check, Loader2, FileClock, Database, ScrollText,
   Code, FlaskConical, HardDrive, ChevronDown, ChevronRight, ScanSearch,
   Globe, MessageSquare, PlayCircle, Gamepad2, FileText, Download, PackageX,
-  RefreshCw, TrendingDown, AlertTriangle, Layers, FolderMinus,
+  RefreshCw, TrendingDown, AlertTriangle, Layers, FolderMinus, Copy,
 } from 'lucide-react'
 import type { CleanCategory, Volume } from '../types'
 import {
@@ -15,6 +15,7 @@ import { fmtBytes } from '../utils/format'
 import { useTaskDialog } from '../components/ConfirmDialog'
 import { InstallerClean } from './cleanup/InstallerClean'
 import { EmptyDirClean } from './cleanup/EmptyDirClean'
+import { DupFinder } from './cleanup/DupFinder'
 import { EmptyArtIcon } from './cleanup/EmptyArtIcon'
 
 /**
@@ -629,7 +630,7 @@ function JunkScan() {
 }
 
 /**
- * 清理页容器：三个子功能平级放在页签里。
+ * 清理页容器：四个子功能平级放在页签里。
  *
  * 为什么拆成三个而不是塞进同一张列表：
  *   · 「垃圾」是按规则/目录批量清，默认勾选；
@@ -640,6 +641,7 @@ const TABS = [
   { id: 'junk', label: '垃圾扫描', icon: Trash2, hint: '系统与环境垃圾，按规则批量清理' },
   { id: 'installer', label: '安装包清理', icon: PackageX, hint: '你下载过的安装包，默认不勾选' },
   { id: 'emptydir', label: '空文件夹', icon: FolderMinus, hint: '完全为空的目录，默认不勾选' },
+  { id: 'dupes', label: '重复文件', icon: Copy, hint: '内容完全相同的副本，每组保留一份' },
 ] as const
 
 type TabId = (typeof TABS)[number]['id']
@@ -679,6 +681,7 @@ export function Cleanup() {
         {tab === 'junk' && <JunkScan />}
         {tab === 'installer' && <InstallerClean />}
         {tab === 'emptydir' && <EmptyDirClean />}
+        {tab === 'dupes' && <DupFinder />}
       </div>
     </div>
   )

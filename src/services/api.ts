@@ -1,7 +1,7 @@
 // ============ 数据服务层（双模式） ============
 // Tauri 环境: invoke Rust 命令（真实数据）
 // 浏览器预览: 回落 Mock（与 Tauri 命令同契约）
-import type { Volume, FileNode, CleanCategory, InstalledApp, ResidualItem, CleanReport, HardwareInfo, PhysicalDisk, AppSettings, CloseAction, InstallerItem, EmptyDirItem, IdentifyResult, AiAnalysis, AiConfigPublic, AiMessage, AiBatchResult } from '../types'
+import type { Volume, FileNode, CleanCategory, InstalledApp, ResidualItem, CleanReport, HardwareInfo, PhysicalDisk, AppSettings, CloseAction, InstallerItem, EmptyDirItem, IdentifyResult, AiAnalysis, AiConfigPublic, AiMessage, AiBatchResult, DupReport, DupDeleteReport } from '../types'
 import { Channel } from '@tauri-apps/api/core'
 
 export const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
@@ -578,6 +578,50 @@ export async function deleteEmptyDirs(
   return inv<[number, number]>('delete_empty_dirs', { paths, onProgress: ch })
 }
 
+/** 重复文件：三段式扫描（大小 → 前缀 → 全量比对），可取消 */
+export async function findDuplicates(
+  roots: string[],
+  skipSystem: boolean,
+  onProgress?: (p: { phase: string; scanned: number; groups: number }) => void,
+): Promise<DupReport> {
+  if (!isTauri) {
+    return new Promise((resolve) => {
+      let n = 0
+      const timer = setInterval(() => {
+        n += 4300
+        onProgress?.({ phase: '正在比对内容…', scanned: n, groups: Math.floor(n / 9000) })
+        if (n >= 26000) {
+          clearInterval(timer)
+          onProgress?.({ phase: '完成', scanned: 26000, groups: 2 })
+          resolve(mockDupes)
+        }
+      }, 120)
+    })
+  }
+  const ch = new Channel<{ phase?: string; scanned?: number; groups?: number }>()
+  if (onProgress) {
+    ch.onmessage = (m) =>
+      onProgress({ phase: m.phase ?? '', scanned: m.scanned ?? 0, groups: m.groups ?? 0 })
+  }
+  return inv<DupReport>('find_duplicates', { roots, skipSystem, onProgress: ch })
+}
+
+export async function cancelDupes(): Promise<void> {
+  if (!isTauri) return
+  try {
+    await inv<void>('cancel_dupes')
+  } catch {
+    /* 忽略 */
+  }
+}
+
+export async function deleteDuplicates(paths: string[]): Promise<DupDeleteReport> {
+  if (!isTauri) {
+    return { freed: paths.length * 12_000_000, failed: 0, pendingReboot: 0, refused: [] }
+  }
+  return inv<DupDeleteReport>('delete_duplicates', { paths })
+}
+
 export async function getInstalledApps(force = false): Promise<InstalledApp[]> {
   if (!isTauri) return mockApps
   return cached('apps', TTL.apps, () => inv<InstalledApp[]>('list_apps'), force)
@@ -1010,6 +1054,32 @@ export async function openExternal(url: string): Promise<void> {
 
 const MOCK_AI_KEY = 'dm.mock.ai'
 
+/** 浏览器预览用的重复文件样本：注意路径只是示例，不会真的删除 */
+const mockDupes: DupReport = {
+  scanned: 26000,
+  wasted: 2_480_000_000 + 620_000_000,
+  cancelled: false,
+  groups: [
+    {
+      size: 1_240_000_000,
+      wasted: 2_480_000_000,
+      files: [
+        { path: 'D:\\素材\\旅行\\原片.mp4', size: 1_240_000_000, mtime: 1710000000 },
+        { path: 'D:\\备份\\旅行\\原片.mp4', size: 1_240_000_000, mtime: 1720000000 },
+        { path: 'E:\\拷贝\\原片.mp4', size: 1_240_000_000, mtime: 1725000000 },
+      ],
+    },
+    {
+      size: 620_000_000,
+      wasted: 620_000_000,
+      files: [
+        { path: 'C:\\Users\\Public\\安装包\\剪辑软件.exe', size: 620_000_000, mtime: 1700000000 },
+        { path: 'D:\\下载\\剪辑软件.exe', size: 620_000_000, mtime: 1715000000 },
+      ],
+    },
+  ],
+}
+
 const MOCK_BUILTIN: AiConfigPublic = {
   provider: 'builtin',
   baseUrl: 'https://api.agnes-ai.cn/v1',
@@ -1018,6 +1088,7 @@ const MOCK_BUILTIN: AiConfigPublic = {
   hasKey: true,
   keyHint: '内置额度',
   isBuiltin: true,
+  assistantName: '',
 }
 
 function mockAiConfig(): AiConfigPublic {
@@ -1040,6 +1111,8 @@ export async function aiSaveConfig(patch: {
   enabled: boolean
   /** 传 undefined 表示不修改已保存的 Key；传空串表示清除 */
   apiKey?: string
+  /** 称呼：undefined = 不改动（兼容只改模型的调用） */
+  assistantName?: string
 }): Promise<AiConfigPublic> {
   if (!isTauri) {
     const prev = mockAiConfig()
@@ -1052,6 +1125,7 @@ export async function aiSaveConfig(patch: {
       hasKey: builtin ? true : patch.apiKey === undefined ? prev.hasKey : patch.apiKey.length > 0,
       keyHint: builtin ? '内置额度' : prev.keyHint,
       isBuiltin: builtin,
+      assistantName: patch.assistantName ?? prev.assistantName,
     }
     try { localStorage.setItem(MOCK_AI_KEY, JSON.stringify(next)) } catch { /* 忽略 */ }
     return next
@@ -1062,15 +1136,8 @@ export async function aiSaveConfig(patch: {
     model: patch.model,
     enabled: patch.enabled,
     apiKey: patch.apiKey ?? null,
+    assistantName: patch.assistantName ?? null,
   })
-}
-
-export async function aiClearKey(): Promise<AiConfigPublic> {
-  if (!isTauri) {
-    try { localStorage.removeItem(MOCK_AI_KEY) } catch { /* 忽略 */ }
-    return mockAiConfig()
-  }
-  return inv<AiConfigPublic>('ai_clear_key')
 }
 
 export async function aiTestConnection(baseUrl: string, model: string, apiKey?: string): Promise<string> {

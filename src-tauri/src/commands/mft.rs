@@ -232,8 +232,10 @@ fn parse_record(rec: &mut [u8], sector: usize, record_no: u64, out: &mut Vec<Mft
     }
 
     // 一条记录内的所有名字与大小
-    let mut names: Vec<(u64, String, u64)> = Vec::new(); // (parent, name, mtime)
-    let mut size: u64 = 0;
+    let mut names: Vec<(u64, String, u64, u64)> = Vec::new(); // (parent, name, mtime, FN 里的实大小)
+    // $DATA 里的精确大小。None 表示这条记录里**没有**无名 $DATA —— 常见于
+    // 碎片极多的文件：数据属性被放进了扩展记录（$ATTRIBUTE_LIST），主记录里看不到。
+    let mut data_size: Option<u64> = None;
 
     let mut off = first_attr;
     let mut guard = 0usize;
@@ -260,6 +262,10 @@ fn parse_record(rec: &mut [u8], sector: usize, record_no: u64, out: &mut Vec<Mft
                         let c = &rec[s..s + content_len];
                         let parent = u64le(c, 0) & 0x0000_FFFF_FFFF_FFFF;
                         let mtime = filetime_to_unix(u64le(c, 0x10));
+                        // $FILE_NAME 里自带一份 RealSize（0x30）。它不是权威值，
+                        // 但当 $DATA 跑到扩展记录里时，这是唯一能拿到的大小 ——
+                        // 否则那种文件会显示成 0 字节，连带目录体积也算少。
+                        let fn_size = if content_len >= 0x38 { u64le(c, 0x30) } else { 0 };
                         let name_len = c[0x40] as usize;
                         let ns = c[0x41];
                         // ns == 2 是 DOS 8.3 短名，跳过，否则同一文件会出现两次
@@ -269,7 +275,7 @@ fn parse_record(rec: &mut [u8], sector: usize, record_no: u64, out: &mut Vec<Mft
                                 .collect();
                             let name = String::from_utf16_lossy(&units);
                             if !name.is_empty() && name != "." {
-                                names.push((parent, name, mtime));
+                                names.push((parent, name, mtime, fn_size));
                             }
                         }
                     }
@@ -280,13 +286,13 @@ fn parse_record(rec: &mut [u8], sector: usize, record_no: u64, out: &mut Vec<Mft
                 let name_len = rec[off + 9];
                 if name_len == 0 {
                     let non_resident = rec[off + 8];
-                    size = if non_resident == 1 {
+                    data_size = Some(if non_resident == 1 {
                         // non-resident：real_size 在 0x30（逻辑大小，不是占用的簇数）
-                        if alen >= 0x38 { u64le(rec, off + 0x30) } else { size }
+                        if alen >= 0x38 { u64le(rec, off + 0x30) } else { data_size.unwrap_or(0) }
                     } else {
                         // resident：内容长度就是大小
                         u32le(rec, off + 0x10) as u64
-                    };
+                    });
                 }
             }
             _ => {}
@@ -294,7 +300,9 @@ fn parse_record(rec: &mut [u8], sector: usize, record_no: u64, out: &mut Vec<Mft
         off += alen;
     }
 
-    for (parent, name, mtime) in names {
+    for (parent, name, mtime, fn_size) in names {
+        // 优先用 $DATA 的精确值；拿不到才退回 $FILE_NAME 的 RealSize
+        let size = data_size.unwrap_or(fn_size);
         out.push(MftEntry {
             // 记录号由读取位置推算，比记录头里的字段可靠（老版本 NTFS 没有那个字段）
             id: record_no,
@@ -376,4 +384,100 @@ pub fn read_entries(letter: &str) -> Result<Vec<MftEntry>, String> {
 /// 根目录的记录号（供上层建树用）
 pub const fn root_id() -> u64 {
     ROOT_RECORD
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 造一条合法的 FILE 记录（含 USA 修正），用于验证解析口径。
+    ///
+    /// `data` 为 None 表示主记录里没有无名 $DATA —— 模拟"数据属性被放进扩展记录"
+    /// 的碎片文件：这时只能退回 $FILE_NAME 里的 RealSize。
+    fn make_record(fn_size: u64, data: Option<u32>, ns: u8) -> Vec<u8> {
+        let sector = 512usize;
+        let mut rec = vec![0u8; 1024];
+        rec[0..4].copy_from_slice(b"FILE");
+        // USA：数组在 0x30，共 3 项（USN + 两个扇区末两字节的原值）
+        rec[4..6].copy_from_slice(&0x30u16.to_le_bytes());
+        rec[6..8].copy_from_slice(&3u16.to_le_bytes());
+        rec[0x30..0x32].copy_from_slice(&1u16.to_le_bytes());
+        // 两个扇区末尾写 USN（解析时会被替换回来）
+        for end in [sector, sector * 2] {
+            rec[end - 2..end].copy_from_slice(&1u16.to_le_bytes());
+        }
+        // 记录头：使用中 + 非目录
+        rec[0x16..0x18].copy_from_slice(&0x01u16.to_le_bytes());
+        let attr_off = 0x38usize;
+        rec[0x14..0x16].copy_from_slice(&(attr_off as u16).to_le_bytes());
+
+        // ---- $FILE_NAME ----
+        let name: Vec<u16> = "big.bin".encode_utf16().collect();
+        let content_len = 0x42 + name.len() * 2;
+        let alen = (0x18 + content_len + 7) & !7;
+        let a = attr_off;
+        rec[a..a + 4].copy_from_slice(&ATTR_FILE_NAME.to_le_bytes());
+        rec[a + 4..a + 8].copy_from_slice(&(alen as u32).to_le_bytes());
+        rec[a + 8] = 0; // resident
+        rec[a + 0x10..a + 0x14].copy_from_slice(&(content_len as u32).to_le_bytes());
+        rec[a + 0x14..a + 0x16].copy_from_slice(&0x18u16.to_le_bytes());
+        let c = a + 0x18;
+        rec[c..c + 8].copy_from_slice(&5u64.to_le_bytes()); // parent = 5
+        rec[c + 0x30..c + 0x38].copy_from_slice(&fn_size.to_le_bytes());
+        rec[c + 0x40] = name.len() as u8;
+        rec[c + 0x41] = ns;
+        for (i, u) in name.iter().enumerate() {
+            rec[c + 0x42 + i * 2..c + 0x44 + i * 2].copy_from_slice(&u.to_le_bytes());
+        }
+
+        // ---- 可选的无名 $DATA ----
+        let mut next = a + alen;
+        if let Some(len) = data {
+            let dlen = 0x18 + 4;
+            rec[next..next + 4].copy_from_slice(&ATTR_DATA.to_le_bytes());
+            rec[next + 4..next + 8].copy_from_slice(&(dlen as u32).to_le_bytes());
+            rec[next + 8] = 0; // resident
+            rec[next + 9] = 0; // 无名
+            rec[next + 0x10..next + 0x14].copy_from_slice(&len.to_le_bytes());
+            rec[next + 0x14..next + 0x16].copy_from_slice(&0x18u16.to_le_bytes());
+            next += dlen;
+        }
+        rec[next..next + 4].copy_from_slice(&ATTR_END.to_le_bytes());
+        rec
+    }
+
+    fn parse(mut rec: Vec<u8>) -> Vec<MftEntry> {
+        let mut out = Vec::new();
+        parse_record(&mut rec, 512, 42, &mut out);
+        out
+    }
+
+    #[test]
+    fn 数据属性缺失时退回文件名里的大小() {
+        // 碎片文件：$DATA 在扩展记录，主记录只有 $FILE_NAME
+        let got = parse(make_record(9_876_543_210, None, 1));
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].size, 9_876_543_210, "不能因为主记录里没有 $DATA 就当成 0 字节");
+        assert_eq!(got[0].name, "big.bin");
+        assert_eq!(got[0].parent, 5);
+    }
+
+    #[test]
+    fn 有数据属性时以它为准() {
+        let got = parse(make_record(123, Some(456), 1));
+        assert_eq!(got[0].size, 456, "$DATA 是权威值，应优先于 $FILE_NAME");
+    }
+
+    #[test]
+    fn 八三短名被跳过() {
+        assert!(parse(make_record(1, Some(1), 2)).is_empty(), "ns=2 是 DOS 短名，会和长名重复计数");
+    }
+
+    #[test]
+    fn 元文件记录被跳过() {
+        let mut rec = make_record(1, Some(1), 1);
+        let mut out = Vec::new();
+        parse_record(&mut rec, 512, 5, &mut out); // 5 号是 $Extend 这类元文件
+        assert!(out.is_empty());
+    }
 }

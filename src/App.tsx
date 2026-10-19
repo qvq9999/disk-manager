@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Cpu, HardDrive, Trash2, Package, Sun, Moon, AlertTriangle, Menu, Settings as SettingsIcon } from 'lucide-react'
 import type { Page, Volume } from './types'
 import { getVolumes, getAppSettings, acceptDisclaimer, peekVolumes, warmUp, isElevated, restartAsAdmin, onCloseRequested } from './services/api'
@@ -38,6 +38,8 @@ const TITLES: Record<Page, string> = {
 
 export default function App() {
   const [page, setPage] = useState<Page>('hardware')
+  /** 主内容滚动容器：切页后要回到顶部 */
+  const contentRef = useRef<HTMLDivElement>(null)
   const [volumes, setVolumes] = useState<Volume[]>(() => peekVolumes() ?? [])
   const [drive, setDrive] = useState<Volume | null>(null)
   const [dark, setDark] = useState(false)
@@ -73,6 +75,15 @@ export default function App() {
       window.clearTimeout(t)
     }
   }, [])
+
+  // 切页回到顶部。
+  //
+  // 之前换页只替换子节点、不重置滚动位置：从「设置」滚到底再点进 AI 配置，
+  // 打开就停在中间那一截，看起来像"内容缺失"。下钻（空间分析进目录）不是切页，
+  // 不经过这里，那层自己的滚动位置不受影响。
+  useEffect(() => {
+    contentRef.current?.scrollTo({ top: 0 })
+  }, [page])
 
   // 启动预热：空闲时后台预取硬件信息/盘符，用户切页时通常已就绪；同时兜底捕获异常
   useEffect(() => {
@@ -222,7 +233,7 @@ export default function App() {
             {dark ? <Sun size={17} /> : <Moon size={17} />}
           </button>
         </div>
-        <div className="content" style={{ display: 'flex', flexDirection: 'column' }}>
+        <div className="content" ref={contentRef} style={{ display: 'flex', flexDirection: 'column' }}>
           {fatal && (
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12, padding: '8px 12px', borderRadius: 8, background: 'rgba(220,38,38,.08)', border: '1px solid rgba(220,38,38,.25)', fontSize: 12.5 }}>
               <AlertTriangle size={14} color="var(--danger)" />

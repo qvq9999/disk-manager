@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "disk-manager",
-  "version": "1.3.6",
+  "version": "1.3.7",
   "identifier": "com.workbuddy.diskmanager",
   "build": {
     "frontendDist": "../dist",
@@ -41,8 +41,8 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "publisher": "WorkBuddy",
-    "copyright": "© 2026 WorkBuddy",
+    "publisher": "qvq9999",
+    "copyright": "© 2026 qvq9999",
     "createUpdaterArtifacts": true,
     "shortDescription": "Windows 磁盘存储管理工具",
     "longDescription": "磁盘总览、空间分析、垃圾清理、软件卸载与硬件信息，一站式 Windows 存储管理。",

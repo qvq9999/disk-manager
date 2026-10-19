@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
-import { Sparkles, X, Send, Settings as SettingsIcon, Loader2, AlertTriangle } from 'lucide-react'
+import { Sparkles, X, Send, Settings as SettingsIcon, Loader2, AlertTriangle, Trash2 } from 'lucide-react'
 import type { AiConfigPublic, AiMessage, Page } from '../types'
 import { aiChatStream, aiGetConfig, aiSuggest } from '../services/api'
-import { answerLocally } from '../services/knowledge'
+import { answerLocally, SUGGESTIONS } from '../services/knowledge'
 import { guideFor } from '../services/aiGuide'
 import { usePrefs } from '../services/prefs'
 import { useAiContext } from '../services/aiContext'
@@ -17,6 +17,59 @@ import { useAiContext } from '../services/aiContext'
  * - **未配置 Key 也能用**：常见问题走本地问答库，答不了才提示去配置。
  *   否则用户点开发现「什么都没有」，会认为功能坏了。
  */
+/**
+ * 对话历史持久化。
+ *
+ * 之前关掉面板就全丢：用户问了一半、去别的页面看一眼、回来就得重新描述问题。
+ * 只存文本（role/content），不存任何附件或页面数据；上限 50 条，超出丢最早的。
+ */
+/**
+ * 首屏预设问题。选这三条的原因：一条问身份（最容易问、以前必编）、
+ * 一条问版本（验证知识库检索）、一条问最常见的实际决策（能不能删）。
+ */
+const STARTERS = [
+  '这个软件是谁做的',
+  '最近这个版本改了什么',
+  '哪些东西可以放心删',
+]
+
+const HISTORY_KEY = 'dm-ai-history-v1'
+const HISTORY_MAX = 50
+
+function loadHistory(): AiMessage[] {
+  try {
+    const raw = localStorage.getItem(HISTORY_KEY)
+    if (!raw) return []
+    const arr = JSON.parse(raw) as unknown
+    if (!Array.isArray(arr)) return []
+    return arr
+      .filter((m): m is AiMessage =>
+        !!m && typeof (m as AiMessage).content === 'string' &&
+        ((m as AiMessage).role === 'user' || (m as AiMessage).role === 'assistant'))
+      .slice(-HISTORY_MAX)
+  } catch {
+    return []
+  }
+}
+
+/**
+ * 按字符预算裁剪历史。
+ *
+ * 模型侧的上下文是有限的，但更现实的问题是费用：一次带上几十轮旧对话，
+ * 每个问题都在为几小时前的闲聊付费。这里从最新往回取，累计超过预算就停。
+ */
+function trimForModel(list: AiMessage[], maxChars = 4000): AiMessage[] {
+  const out: AiMessage[] = []
+  let total = 0
+  for (let i = list.length - 1; i >= 0; i--) {
+    const len = list[i].content.length
+    if (out.length > 0 && total + len > maxChars) break
+    out.unshift(list[i])
+    total += len
+  }
+  return out
+}
+
 export function AiAssistant({
   page,
   pageTitle,
@@ -34,7 +87,7 @@ export function AiAssistant({
 }) {
   const [open, setOpen] = useState(false)
   const [cfg, setCfg] = useState<AiConfigPublic | null>(null)
-  const [msgs, setMsgs] = useState<AiMessage[]>([])
+  const [msgs, setMsgs] = useState<AiMessage[]>(() => loadHistory())
   const [input, setInput] = useState('')
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState<string | null>(null)
@@ -67,6 +120,16 @@ export function AiAssistant({
       window.clearTimeout(t)
     }
   }, [open])
+
+  // 落盘：流式期间跳过（每个 token 都写一次 localStorage 会把主线程拖慢）
+  useEffect(() => {
+    if (busy) return
+    try {
+      localStorage.setItem(HISTORY_KEY, JSON.stringify(msgs.slice(-HISTORY_MAX)))
+    } catch {
+      /* 超出配额等情况忽略：历史丢了不影响使用 */
+    }
+  }, [msgs, busy])
 
   // 只滚消息区，不动整页
   useEffect(() => {
@@ -128,7 +191,7 @@ export function AiAssistant({
         .filter(Boolean)
         .join('\n')
 
-      const full = await aiChatStream(next, ctx, (t) => {
+      const full = await aiChatStream(trimForModel(next), ctx, (t) => {
         setMsgs((prev) => {
           const last = prev[prev.length - 1]
           if (!last || last.role !== 'assistant') return prev
@@ -186,13 +249,26 @@ export function AiAssistant({
           <div className="ai-head">
             <span className="ai-head-icon"><Sparkles size={15} /></span>
             <div style={{ minWidth: 0, flex: 1 }}>
-              <div style={{ fontSize: 13, fontWeight: 600 }}>AI 助手</div>
+              <div style={{ fontSize: 13, fontWeight: 600 }}>
+                {cfg?.assistantName?.trim() || 'AI 助手'}
+              </div>
               <div className="ai-head-sub">
                 {configured
                   ? `${cfg?.isBuiltin ? '内置额度' : cfg?.provider || '自定义'} · ${cfg?.model || '未指定模型'}`
                   : '本地问答模式（AI 已关闭）'}
               </div>
             </div>
+            {msgs.length > 0 && (
+              <button
+                type="button"
+                className="icon-btn"
+                onClick={() => { setMsgs([]); setSuggests([]); setErr(null) }}
+                title="清空对话记录"
+                aria-label="清空对话记录"
+              >
+                <Trash2 size={15} />
+              </button>
+            )}
             <button
               type="button"
               className="icon-btn"
@@ -231,6 +307,11 @@ export function AiAssistant({
                 </div>
                 <div className="ai-chips">
                   {guide.chips.map((s) => (
+                    <button key={s} type="button" className="ai-chip" onClick={() => void send(s)}>
+                      {s}
+                    </button>
+                  ))}
+                  {STARTERS.filter((s) => !guide.chips.includes(s)).map((s) => (
                     <button key={s} type="button" className="ai-chip" onClick={() => void send(s)}>
                       {s}
                     </button>

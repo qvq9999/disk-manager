@@ -299,6 +299,37 @@ export interface AiConfigPublic {
   keyHint: string
   /** 当前是否在用内置额度 */
   isBuiltin: boolean
+  /** 助手称呼（空 = 默认「AI 助手」） */
+  assistantName: string
+}
+
+/** 重复文件：同内容的一组 */
+export interface DupFile {
+  path: string
+  size: number
+  mtime: number
+}
+
+export interface DupGroup {
+  size: number
+  /** 只保留一份能省下的字节 */
+  wasted: number
+  files: DupFile[]
+}
+
+export interface DupReport {
+  groups: DupGroup[]
+  scanned: number
+  wasted: number
+  cancelled: boolean
+}
+
+export interface DupDeleteReport {
+  freed: number
+  failed: number
+  pendingReboot: number
+  /** 被拒绝的路径（系统目录、非普通文件等） */
+  refused: string[]
 }
 
 export interface AiMessage {

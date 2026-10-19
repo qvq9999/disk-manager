@@ -1,7 +1,7 @@
 {
   "name": "disk-manager",
   "private": true,
-  "version": "1.3.6",
+  "version": "1.3.7",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -22,5 +22,12 @@
     "@vitejs/plugin-react": "4.3.4",
     "typescript": "5.6.3",
     "vite": "5.4.11"
+  },
+  "author": "qvq9999",
+  "license": "MIT",
+  "homepage": "https://github.com/qvq9999/disk-manager",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/qvq9999/disk-manager.git"
   }
 }

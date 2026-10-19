@@ -42,7 +42,11 @@ export function DriveDetail({ volume, onBack, onGotoClean }: { volume: Volume; o
 
   // 结果被看到后清掉总览页的「已完成」提示
   useEffect(() => {
-    if (root && task?.status === 'done' && !task.seen) markScanSeen(letter)
+    if (root && task?.status === 'done' && !task.seen) {
+      markScanSeen(letter)
+      // 重新扫描后旧节点可能已不存在，选中项必须失效
+      setPicked(null)
+    }
   }, [root, task?.status, task?.seen, letter])
 
   const cur = useMemo(() => {
@@ -75,11 +79,15 @@ export function DriveDetail({ volume, onBack, onGotoClean }: { volume: Volume; o
   const aiSummary = useMemo(() => {
     if (!cur) return ''
     const kids = listItems.filter((n) => !n.name.startsWith('（其余 ')).slice(0, 5)
+    const rest = listItems.find((n) => n.name.startsWith('（其余 '))
     const lines = [`当前目录：${absPath}，共 ${fmtBytes(cur.size, 1)}`]
     if (kids.length > 0) {
       lines.push('这一层最大的几项：')
       kids.forEach((n, i) => lines.push(`${i + 1}. ${n.name}，${fmtBytes(n.size, 1)}`))
     }
+    // 目录太大时只展示前 200 项，其余合并成一行。这句必须给模型看，
+    // 否则它会拿"总大小"去解释"列出的几项"，得出与事实不符的结论。
+    if (rest) lines.push(`其余${rest.name.replace('（其余 ', '').replace('）', '')}合计 ${fmtBytes(rest.size, 1)}（未逐项列出）`)
     return lines.join('\n').slice(0, 500)
     // absPath / listItems 都由 cur 与 path 派生，依赖它们即可
   }, [cur, listItems, absPath])
@@ -100,8 +108,18 @@ export function DriveDetail({ volume, onBack, onGotoClean }: { volume: Volume; o
     )
   }
 
-  const goUp = () => setPath((p) => p.slice(0, -1))
+  const goUp = () => {
+    // 选中项必须一起清掉：否则右侧仍显示上一层选中的文件，而路径已经换成上级目录，
+    // 看起来就是「识别到的文件和实际文件夹对不上」。
+    setPicked(null)
+    setPath((p) => p.slice(0, -1))
+  }
   const canOpen = (n: FileNode) => n.kind === 'dir' && !!n.children && n.children.length > 0
+  /**
+   * 「（其余 N 项）」是聚合行，磁盘上并不存在这个目录。
+   * 之前它被当成普通文件夹，点一下就会去识别一个不存在的路径 —— 结论自然不对。
+   */
+  const isAggregate = (n: FileNode) => n.name.startsWith('（其余 ')
 
   const enter = (name: string) => {
     setPicked(null)
@@ -155,10 +173,24 @@ export function DriveDetail({ volume, onBack, onGotoClean }: { volume: Volume; o
             return (
               <button
                 key={c.name}
-                className={`folder-row${picked === c ? ' active' : ''}`}
-                onClick={() => (canOpen(c) ? enter(c.name) : setPicked(c))}
-                onContextMenu={(e) => onRowMenu(e, c)}
-                title={c.kind === 'dir' && !canOpen(c) ? '已到展示深度上限（体积已完整统计）' : undefined}
+                className={`folder-row${picked === c ? ' active' : ''}${isAggregate(c) ? ' aggregate' : ''}`}
+                onClick={() => {
+                  if (isAggregate(c)) return
+                  if (canOpen(c)) enter(c.name)
+                  else setPicked(c)
+                }}
+                onContextMenu={(e) => {
+                  if (isAggregate(c)) e.preventDefault()
+                  else onRowMenu(e, c)
+                }}
+                disabled={isAggregate(c)}
+                title={
+                  isAggregate(c)
+                    ? '上面已显示最大的 200 项，其余项目合并统计在这里'
+                    : c.kind === 'dir' && !canOpen(c)
+                      ? '已到展示深度上限（体积已完整统计）'
+                      : undefined
+                }
               >
                 <span className={`f-icon${c.kind === 'file' ? ' file' : ''}`}>
                   {c.kind === 'dir' ? <Folder size={15} /> : <FileIcon size={15} />}
