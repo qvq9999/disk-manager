@@ -71,6 +71,227 @@ pub fn cleanup_update_leftovers() -> usize {
     cleanup_leftovers_in(&dir)
 }
 
+// ---------------- 安装位置记录 与 多余安装清理 ----------------
+//
+// 事故背景（v1.3.7）：
+//   安装器靠 `Software\<publisher>\<product>` 的默认值记住上次安装目录。
+//   v1.3.7 把 publisher 从 WorkBuddy 改成 qvq9999 后，这个键换了名字，旧记录读不到，
+//   安装器回落到默认的 `C:\Program Files\disk-manager` —— 原本装在 D 盘的用户
+//   于是被装成了两份：D 盘旧版还在，C 盘多一份新版。
+//
+// 两道修：
+//   ① 每次启动写 `RunningFrom`，安装器（windows/installer-hooks.nsh）优先读它，
+//      把更新装回同一目录，从源头不再产生第二份；
+//   ② 安装器装完打一个 `CleanOthers` 标记，应用下次启动时把"另一份"清掉，
+//      用于修复已经产生了两份的机器。
+
+use std::path::{Path, PathBuf};
+use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE};
+use winreg::RegKey;
+
+/// ⚠️ 必须与 `windows/installer-hooks.nsh` 里的键名完全一致。
+pub const META_KEY: &str = r"Software\qvq9999\disk-manager";
+/// publisher 改名前的键（v1.3.6 及更早）。
+const LEGACY_META_KEYS: &[&str] = &[r"Software\WorkBuddy\disk-manager"];
+const UNINST_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\disk-manager";
+const MAIN_EXE: &str = "app.exe";
+const UNINST_EXE: &str = "uninstall.exe";
+
+fn current_install_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    exe.parent().map(|p| p.to_path_buf())
+}
+
+fn norm_path(s: &str) -> Option<PathBuf> {
+    let t = s.trim().trim_matches('"').trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(t))
+    }
+}
+
+fn read_str(root: &RegKey, key: &str, name: &str) -> Option<String> {
+    root.open_subkey_with_flags(key, KEY_READ)
+        .ok()?
+        .get_value::<String, _>(name)
+        .ok()
+}
+
+/// 启动时记录「从哪运行的」。
+///
+/// 只在同目录存在 uninstall.exe 时写：开发时 exe 在 `target\debug` 下，
+/// 没有卸载器，不该被当成安装位置（写进去会让安装器把更新装进构建目录）。
+pub fn write_running_from() -> bool {
+    let Some(dir) = current_install_dir() else { return false };
+    if !dir.join(UNINST_EXE).is_file() {
+        return false;
+    }
+    let Ok((key, _)) = RegKey::predef(HKEY_LOCAL_MACHINE).create_subkey(META_KEY) else {
+        return false;
+    };
+    key.set_value("RunningFrom", &dir.to_string_lossy().to_string())
+        .is_ok()
+}
+
+/// 安装器装完会留下标记，读一次并清掉 —— 只有刚更新过才需要清理多余安装。
+fn take_clean_flag() -> bool {
+    let Ok(key) = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(META_KEY, KEY_READ | KEY_WRITE)
+    else {
+        return false;
+    };
+    let on = key.get_value::<u32, _>("CleanOthers").map(|v| v == 1).unwrap_or(false);
+    if on {
+        let _ = key.delete_value("CleanOthers");
+    }
+    on
+}
+
+/// 所有可能藏着「另一份安装」的目录。
+fn candidate_dirs() -> Vec<PathBuf> {
+    let root = RegKey::predef(HKEY_LOCAL_MACHINE);
+    let mut out: Vec<PathBuf> = Vec::new();
+
+    // ① 位置记录（新键的 RunningFrom 最准，默认值是上一次的安装目录）
+    for k in std::iter::once(META_KEY).chain(LEGACY_META_KEYS.iter().copied()) {
+        if let Some(v) = read_str(&root, k, "RunningFrom") {
+            if let Some(p) = norm_path(&v) {
+                out.push(p);
+            }
+        }
+        if let Some(v) = read_str(&root, k, "") {
+            if let Some(p) = norm_path(&v) {
+                out.push(p);
+            }
+        }
+    }
+
+    // ② 卸载项里登记的安装位置（带引号）
+    if let Some(v) = read_str(&root, UNINST_KEY, "InstallLocation") {
+        if let Some(p) = norm_path(&v) {
+            out.push(p);
+        }
+    }
+
+    // ③ 常见默认位置：安装器回落到默认路径时就是这几个之一
+    for var in ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"] {
+        if let Ok(base) = std::env::var(var) {
+            if !base.trim().is_empty() {
+                out.push(PathBuf::from(base).join("disk-manager"));
+            }
+        }
+    }
+    out
+}
+
+fn same_dir(a: &Path, b: &Path) -> bool {
+    let ca = a.canonicalize().unwrap_or_else(|_| a.to_path_buf());
+    let cb = b.canonicalize().unwrap_or_else(|_| b.to_path_buf());
+    ca.to_string_lossy().eq_ignore_ascii_case(&cb.to_string_lossy())
+}
+
+/// 对某个候选目录该怎么处理。抽成纯函数，好在沙箱目录里测。
+#[derive(Debug, PartialEq)]
+enum DirPlan {
+    /// 不处理（附原因，仅用于日志）
+    Skip(&'static str),
+    /// 目录里只有本程序的文件 → 整个目录删掉
+    RemoveAll,
+    /// 还混着别的东西 → 只删本程序的两个文件，保留目录
+    RemoveFiles(Vec<PathBuf>),
+}
+
+fn plan_for_dir(dir: &Path, current: &Path) -> DirPlan {
+    if same_dir(dir, current) {
+        return DirPlan::Skip("就是当前正在用的目录");
+    }
+    if !dir.is_dir() {
+        return DirPlan::Skip("目录不存在");
+    }
+    let main = dir.join(MAIN_EXE);
+    let uninst = dir.join(UNINST_EXE);
+    if !main.is_file() || !uninst.is_file() {
+        return DirPlan::Skip("缺少主程序或卸载器，不确认是本程序");
+    }
+    // 只有「目录里除了这两个文件没有别的」才敢整目录删；
+    // 用户可能往安装目录里放过东西（日志、备份），那些不能碰。
+    let mut unknown = false;
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let n = e.file_name().to_string_lossy().to_lowercase();
+            if n != MAIN_EXE && n != UNINST_EXE {
+                unknown = true;
+                break;
+            }
+        }
+    }
+    if unknown {
+        DirPlan::RemoveFiles(vec![main, uninst])
+    } else {
+        DirPlan::RemoveAll
+    }
+}
+
+/// 注册表里登记的版本，是否就是当前正在跑的版本。
+///
+/// 为什么要这道闸：用户可能从「另一份旧安装」启动（两份并存时很常见）。
+/// 那种情况下如果把「刚装好的新版」当成多余安装删掉，等于把更新结果毁了。
+/// 版本对不上就什么都不做，标记留着，等从新版启动时再清。
+fn running_version_matches_installed() -> bool {
+    let Ok(key) =
+        RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(UNINST_KEY, KEY_READ)
+    else {
+        return false;
+    };
+    let ver: String = key.get_value("DisplayVersion").unwrap_or_default();
+    ver.trim() == crate::app_meta::VERSION
+}
+
+/// 清掉除当前目录之外的「另一份安装」。返回给日志用的说明。
+///
+/// 只会在安装器打过 `CleanOthers` 标记后动手，平时调用是零成本的空操作。
+pub fn cleanup_other_installs() -> Vec<String> {
+    let Some(current) = current_install_dir() else {
+        return vec!["取不到当前程序路径，跳过清理".into()];
+    };
+    if !running_version_matches_installed() || !take_clean_flag() {
+        return Vec::new();
+    }
+
+    let mut seen: Vec<PathBuf> = Vec::new();
+    let mut log = Vec::new();
+    for dir in candidate_dirs() {
+        // 多个来源可能指向同一个目录
+        if seen.iter().any(|s| same_dir(s, &dir)) {
+            continue;
+        }
+        seen.push(dir.clone());
+
+        match plan_for_dir(&dir, &current) {
+            DirPlan::Skip(_) => {}
+            DirPlan::RemoveAll => {
+                let r = crate::commands::fsx::remove_dir(&dir);
+                log.push(format!(
+                    "{}：{}",
+                    dir.display(),
+                    if r.ok { "已删除旧安装" } else { "未能完全删除（可能被占用）" }
+                ));
+            }
+            DirPlan::RemoveFiles(files) => {
+                for f in files {
+                    let r = crate::commands::fsx::remove_file(&f);
+                    log.push(format!(
+                        "{}：{}",
+                        f.display(),
+                        if r.ok { "已删除旧文件（目录里还有其它文件，已保留）" } else { "删除失败" }
+                    ));
+                }
+            }
+        }
+    }
+    log
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,5 +387,74 @@ mod tests {
             v["version"],
             sig.as_str().unwrap_or("").len()
         );
+    }
+
+    // ---- 多余安装清理：判定逻辑在沙箱目录里测，不碰真实安装 ----
+
+    fn sandbox(tag: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!("__dm_install_plan_{tag}__"));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join(MAIN_EXE), b"x").unwrap();
+        std::fs::write(base.join(UNINST_EXE), b"x").unwrap();
+        base
+    }
+
+    #[test]
+    fn 计划_当前目录必须跳过() {
+        let d = sandbox("self");
+        assert_eq!(
+            plan_for_dir(&d, &d),
+            DirPlan::Skip("就是当前正在用的目录"),
+            "绝不能把正在运行的这一份当成多余安装删掉"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn 计划_缺卸载器时不认定为本程序() {
+        let d = sandbox("nouninst");
+        std::fs::remove_file(d.join(UNINST_EXE)).unwrap();
+        assert!(matches!(
+            plan_for_dir(&d, &std::env::temp_dir()),
+            DirPlan::Skip(_)
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn 计划_干净目录整目录删除() {
+        let d = sandbox("clean");
+        assert_eq!(plan_for_dir(&d, &std::env::temp_dir()), DirPlan::RemoveAll);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn 计划_混有用户文件时只删程序文件() {
+        let d = sandbox("mixed");
+        std::fs::write(d.join("我的备份.txt"), b"x").unwrap();
+        match plan_for_dir(&d, &std::env::temp_dir()) {
+            DirPlan::RemoveFiles(f) => {
+                assert_eq!(f.len(), 2, "只应删 app.exe 与 uninstall.exe");
+                assert!(f.contains(&d.join(MAIN_EXE)));
+                assert!(f.contains(&d.join(UNINST_EXE)));
+                assert!(
+                    !f.iter().any(|p| p.to_string_lossy().contains("备份")),
+                    "用户放在安装目录里的文件不能删"
+                );
+            }
+            other => panic!("应为只删程序文件，实际 {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn 计划_不存在的目录跳过() {
+        let ghost = std::env::temp_dir().join("__dm_install_plan_ghost__");
+        let _ = std::fs::remove_dir_all(&ghost);
+        assert!(matches!(
+            plan_for_dir(&ghost, &std::env::temp_dir()),
+            DirPlan::Skip(_)
+        ));
     }
 }

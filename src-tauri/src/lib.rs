@@ -84,9 +84,15 @@ pub fn run() {
       // 不会自动删除，每更新一次就在 %TEMP% 里留一个（含安装包）。
       // 异步做，绝不阻塞主窗口出现。
       std::thread::spawn(|| {
+        // 先记下「从哪运行的」：安装器读它把更新装回同一目录，不再另起一份
+        commands::update::write_running_from();
         let n = commands::update::cleanup_update_leftovers();
         if n > 0 {
           log::info!("已清理 {n} 个更新残留目录");
+        }
+        // 只在安装器打过标记时才会真的动手，平时是空操作
+        for line in commands::update::cleanup_other_installs() {
+          log::info!("清理多余安装 · {line}");
         }
       });
 
