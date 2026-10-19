@@ -16,6 +16,30 @@
 
 !include "LogicLib.nsh"
 
+; 「选择安装位置」页的默认值改成 D 盘。
+;
+; 为什么用 GUIInit 而不是安装阶段：目录页显示的是此刻的 $INSTDIR，
+; 若等到 PREINSTALL 再改，用户看到的是 C 盘、实际却装进了 D 盘 —— 那是坑。
+; 也不能自己定义 `.onGUIInit`：MUI2 已经占用了这个函数名，重复定义会直接编译失败。
+; MUI2 提供 `MUI_CUSTOMFUNCTION_GUIINIT` 供挂载（Interface.nsh 里 Call 它）。
+;
+; 只在**全新安装**时生效（默认目录里没有主程序）。已装过的机器保持原目录：
+; 升级不能把程序从用户放它的地方挪走。
+!define MUI_CUSTOMFUNCTION_GUIINIT dmGuiInit
+
+Function dmGuiInit
+  ${IfNot} ${FileExists} "$INSTDIR\app.exe"
+    ; 取默认路径的末级目录名当 D 盘下的目录名（= productName，不写死）
+    ${GetFileName} "$INSTDIR" $2
+    ${If} $2 == ""
+      StrCpy $2 "disk-manager"
+    ${EndIf}
+    ${If} ${FileExists} "D:\*.*"
+      StrCpy $INSTDIR "D:\$2"
+    ${EndIf}
+  ${EndIf}
+FunctionEnd
+
 !macro NSIS_HOOK_PREINSTALL
   ; Section 里已经 SetOutPath 过一次，改完 $INSTDIR 必须重新设置输出目录，
   ; 否则 File 仍会写进原来的位置。
