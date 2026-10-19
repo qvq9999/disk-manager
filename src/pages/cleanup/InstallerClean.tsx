@@ -8,6 +8,7 @@ import {
   scanInstallers, cancelInstallerScan, deleteInstallers, peekVolumes,
 } from '../../services/api'
 import { fmtBytes } from '../../utils/format'
+import { useConfirm } from '../../components/ConfirmDialog'
 import { DrivePicker } from './DrivePicker'
 import { EmptyArtIcon } from './EmptyArtIcon'
 
@@ -45,6 +46,9 @@ export function InstallerClean() {
 
   // 卸载时取消后台扫描，避免切走页签后还在全盘遍历
   useEffect(() => () => { void cancelInstallerScan() }, [])
+
+  // 删除前的二次确认（自绘弹窗）
+  const { ask, node: confirmNode } = useConfirm()
 
   const totalSize = useMemo(() => items.reduce((s, i) => s + i.size, 0), [items])
   const selSize = useMemo(
@@ -95,11 +99,16 @@ export function InstallerClean() {
   const doDelete = async () => {
     const paths = [...sel]
     if (paths.length === 0) return
-    const ok = window.confirm(
-      `将永久删除 ${paths.length} 个安装包（共 ${fmtBytes(selSize, 2)}），不进回收站且不可恢复。\n\n` +
-      `删除的是安装包文件本身，不会卸载任何已安装的软件。\n` +
-      `如果以后还要重装对应软件，需要重新下载。\n\n确定继续？`,
-    )
+    const ok = await ask({
+      title: `删除 ${paths.length} 个安装包`,
+      subtitle: '删除的是安装包文件本身，不会卸载已安装的软件',
+      stats: [
+        { label: '预计释放', value: fmtBytes(selSize, 2), strong: true },
+        { label: '文件数量', value: `${paths.length} 个` },
+      ],
+      warning: '删除后无法恢复，以后重装对应软件需要重新下载。',
+      confirmText: '删除安装包',
+    })
     if (!ok) return
     setPhase('cleaning')
     setPct(0)
@@ -310,6 +319,8 @@ export function InstallerClean() {
           <AlertTriangle size={13} /> 部分文件被正在运行的安装程序占用，关闭后重新扫描再试
         </div>
       )}
+
+      {confirmNode}
     </div>
   )
 }

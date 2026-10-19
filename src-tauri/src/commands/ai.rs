@@ -390,6 +390,97 @@ async fn complete(
         .ok_or_else(|| "服务端返回了空结果".to_string())
 }
 
+/// 流式版本：每收到一小段就回调一次，前端可以边收边显示。
+///
+/// 用 `Response::chunk()` 而不是 `bytes_stream()`，是为了不引入 `StreamExt`。
+/// futures-util 虽然在本机 registry 里，但能少一个直接依赖就少一个（本机拉新 crate 很难）。
+async fn complete_stream(
+    base_url: &str,
+    model: &str,
+    key: &str,
+    messages: Vec<ChatMsg>,
+    max_tokens: u32,
+    temperature: f32,
+    mut on_delta: impl FnMut(&str),
+) -> Result<String, String> {
+    if base_url.trim().is_empty() {
+        return Err("还没有配置接口地址，请到「设置 - AI 助手」里填写".into());
+    }
+    if model.trim().is_empty() {
+        return Err("还没有配置模型名".into());
+    }
+    let url = endpoint(base_url, "/chat/completions");
+    let body = ChatReq {
+        model,
+        messages,
+        max_tokens,
+        temperature,
+        stream: true,
+    };
+    let mut req = client().post(&url).json(&body);
+    if !key.trim().is_empty() {
+        req = req.bearer_auth(key.trim());
+    }
+    let mut resp = req.send().await.map_err(friendly)?;
+    if !resp.status().is_success() {
+        let code = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        let brief: String = text.chars().take(240).collect();
+        let hint = match code.as_u16() {
+            401 | 403 => "鉴权失败：Key 无效或无权访问该模型",
+            404 => "接口地址或模型名不对（404）",
+            429 => "请求过于频繁或额度用尽（429）",
+            _ => "服务端返回错误",
+        };
+        return Err(format!("{hint}。详情：{brief}"));
+    }
+
+    // 网络分片可能把一行 SSE 切断，所以必须按行缓冲，不能拿到一块就解析
+    let mut pending = String::new();
+    let mut full = String::new();
+    while let Some(bytes) = resp.chunk().await.map_err(friendly)? {
+        pending.push_str(&String::from_utf8_lossy(&bytes));
+        while let Some(pos) = pending.find('\n') {
+            let line: String = pending[..pos].trim().to_string();
+            pending.drain(..=pos);
+            let Some(rest) = line.strip_prefix("data:") else { continue };
+            let data = rest.trim();
+            if data.is_empty() || data == "[DONE]" {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else { continue };
+            if let Some(t) = v["choices"][0]["delta"]["content"].as_str() {
+                if !t.is_empty() {
+                    full.push_str(t);
+                    on_delta(t);
+                }
+            }
+        }
+    }
+    if full.is_empty() {
+        return Err("服务端没有返回任何内容".into());
+    }
+    Ok(full)
+}
+
+/// 组装对话消息：系统提示 + 页面上下文 + 最近 8 轮
+fn build_chat_messages(messages: Vec<ChatMsg>, context: &str) -> Vec<ChatMsg> {
+    let mut msgs = vec![ChatMsg {
+        role: "system".into(),
+        content: CHAT_SYSTEM.to_string(),
+    }];
+    if !context.trim().is_empty() {
+        msgs.push(ChatMsg {
+            role: "system".into(),
+            content: format!("当前界面状态（供参考）：\n{context}"),
+        });
+    }
+    // 只带最近 8 轮，防止上下文无限增长把费用推高
+    let start = messages.len().saturating_sub(8);
+    msgs.extend(messages.into_iter().skip(start));
+    msgs
+}
+
 // ============ 命令 ============
 
 #[tauri::command]
@@ -647,22 +738,214 @@ pub async fn ai_chat(
     context: String,
 ) -> Result<String, String> {
     let ai = resolve(&app)?;
+    let msgs = build_chat_messages(messages, &context);
+    complete(&ai.base_url, &ai.model, &ai.key, msgs, 800, 0.4).await
+}
 
-    let mut msgs = vec![ChatMsg {
-        role: "system".into(),
-        content: CHAT_SYSTEM.to_string(),
-    }];
-    if !context.trim().is_empty() {
-        msgs.push(ChatMsg {
-            role: "system".into(),
-            content: format!("当前界面状态（供参考）：\n{context}"),
+/// 流式问答：一边生成一边把增量推给前端。
+///
+/// 返回值是**完整文本**，前端可以拿它做最终校验（流式过程中显示的内容
+/// 与返回值不一致时以返回值为准，防止网络中断导致界面停在一半）。
+#[tauri::command]
+pub async fn ai_chat_stream(
+    app: tauri::AppHandle,
+    messages: Vec<ChatMsg>,
+    context: String,
+    on_chunk: tauri::ipc::Channel<String>,
+) -> Result<String, String> {
+    let ai = resolve(&app)?;
+    let msgs = build_chat_messages(messages, &context);
+    complete_stream(&ai.base_url, &ai.model, &ai.key, msgs, 800, 0.4, |t| {
+        // 前端窗口关闭时发送会失败，这不是错误，忽略即可
+        let _ = on_chunk.send(t.to_string());
+    })
+    .await
+}
+
+// ============ 整层批量分析 ============
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchItem {
+    pub name: String,
+    pub path: String,
+    pub kind: String,
+    pub size: u64,
+    /// 本地采集的结构摘要（子项数、扩展名分布等）
+    pub summary: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchResult {
+    pub name: String,
+    pub what: String,
+    pub can_delete: String,
+    pub consequence: String,
+    pub suggestion: String,
+}
+
+const BATCH_SYSTEM: &str = "你是 Windows 存储管理顾问。用户会给你同一层目录下的若干子项（JSON 数组），\
+请逐个判断：这是什么、能不能删、删了会怎样，并给一句建议。\n\
+canDelete 只能取 safe / caution / danger / unknown 之一，含义：\n\
+- safe：可再生数据，删了不影响软件使用\n\
+- caution：删了可能丢失设置或需要重新下载/重建\n\
+- danger：系统或程序本体，删除会破坏功能\n\
+- unknown：信息不足，无法判断\n\
+只输出 JSON 数组，不要输出任何解释文字。每项格式：\n\
+{\"name\":\"原样返回的名字\",\"what\":\"一句话说明是什么\",\"canDelete\":\"safe\",\"consequence\":\"删了会怎样\",\"suggestion\":\"建议怎么做\"}\n\
+如果信息不足就如实说不知道，不要编造。";
+
+/// 一次分析同一层下的多个子项。
+///
+/// 相比逐个调用，这样可以省掉重复的 system 提示和上下文开销，
+/// 而且模型能看到同层其它项，判断更准（比如「这是某个软件的运行时」）。
+#[tauri::command]
+pub async fn ai_analyze_batch(
+    app: tauri::AppHandle,
+    items: Vec<BatchItem>,
+) -> Result<Vec<BatchResult>, String> {
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+    if items.len() > 8 {
+        return Err("一次最多分析 8 项".into());
+    }
+    let ai = resolve(&app)?;
+
+    let payload: Vec<serde_json::Value> = items
+        .iter()
+        .map(|i| {
+            serde_json::json!({
+                "name": i.name,
+                "path": i.path,
+                "kind": if i.kind == "dir" { "目录" } else { "文件" },
+                "size": crate::commands::ai::human_size(i.size),
+                "summary": i.summary,
+            })
+        })
+        .collect();
+    let user = format!(
+        "以下是同一目录下的 {} 个子项：\n{}",
+        payload.len(),
+        serde_json::to_string_pretty(&payload).unwrap_or_default()
+    );
+
+    let out = complete(
+        &ai.base_url,
+        &ai.model,
+        &ai.key,
+        vec![
+            ChatMsg { role: "system".into(), content: BATCH_SYSTEM.into() },
+            ChatMsg { role: "user".into(), content: user },
+        ],
+        1200,
+        0.2,
+    )
+    .await?;
+
+    let Some(js) = extract_json_array(&out) else {
+        return Err(format!("模型返回的不是 JSON 数组：{}", out.chars().take(120).collect::<String>()));
+    };
+    let arr: Vec<serde_json::Value> = serde_json::from_str(js).map_err(|e| format!("解析失败：{e}"))?;
+
+    // 按名字对齐输入顺序：模型可能调换顺序或漏项，漏掉的补 unknown
+    let mut results = Vec::with_capacity(items.len());
+    for it in &items {
+        let hit = arr.iter().find(|v| {
+            v.get("name").and_then(|n| n.as_str()) == Some(it.name.as_str())
+        });
+        let get = |k: &str| hit.and_then(|v| v.get(k)).and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let can_delete = match get("canDelete").as_str() {
+            "safe" => "safe",
+            "caution" => "caution",
+            "danger" => "danger",
+            _ => "unknown",
+        }
+        .to_string();
+        results.push(BatchResult {
+            name: it.name.clone(),
+            what: get("what"),
+            can_delete,
+            consequence: get("consequence"),
+            suggestion: get("suggestion"),
         });
     }
-    // 只带最近 8 轮，防止上下文无限增长把费用推高
-    let start = messages.len().saturating_sub(8);
-    msgs.extend(messages.into_iter().skip(start));
+    Ok(results)
+}
 
-    complete(&ai.base_url, &ai.model, &ai.key, msgs, 800, 0.4).await
+/// 生成 2~3 个「用户接下来可能会问」的问题。
+///
+/// 单独一次很轻的请求（max_tokens 很小），在回答完成后异步调用，
+/// 不阻塞主回答的显示；失败就静默返回空，不打扰用户。
+#[tauri::command]
+pub async fn ai_suggest(
+    app: tauri::AppHandle,
+    question: String,
+    answer: String,
+) -> Result<Vec<String>, String> {
+    let ai = resolve(&app)?;
+    let cut = |s: &str, n: usize| s.chars().take(n).collect::<String>();
+    let user = format!(
+        "用户问：{}\n\n助手答：{}\n\n\
+         请给出用户最可能继续追问的 3 个问题。要求：每条不超过 20 个字，针对上面的回答，\
+         不要重复已回答的内容。只输出 JSON 字符串数组，例如 [\"问题1\",\"问题2\",\"问题3\"]，不要任何解释。",
+        cut(&question, 200),
+        cut(&answer, 800)
+    );
+    let out = complete(
+        &ai.base_url,
+        &ai.model,
+        &ai.key,
+        vec![
+            ChatMsg {
+                role: "system".into(),
+                content: "你只输出 JSON 数组，不输出任何其它文字。".into(),
+            },
+            ChatMsg { role: "user".into(), content: user },
+        ],
+        200,
+        0.6,
+    )
+    .await?;
+
+    let Some(js) = extract_json_array(&out) else {
+        return Ok(Vec::new());
+    };
+    let Ok(arr) = serde_json::from_str::<Vec<String>>(js) else {
+        return Ok(Vec::new());
+    };
+    Ok(arr
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s.chars().count() <= 40)
+        .take(3)
+        .collect())
+}
+
+/// 从模型输出里抓出最外层的 JSON 数组（模型常会在前后加说明文字或代码块围栏）
+fn extract_json_array(s: &str) -> Option<&str> {
+    let start = s.find('[')?;
+    let end = s.rfind(']')?;
+    if end <= start {
+        return None;
+    }
+    Some(&s[start..=end])
+}
+
+/// 人类可读的体积，用于给模型看（比裸字节数更好理解）
+pub fn human_size(n: u64) -> String {
+    const K: f64 = 1024.0;
+    let f = n as f64;
+    if f >= K * K * K {
+        format!("{:.1} GB", f / (K * K * K))
+    } else if f >= K * K {
+        format!("{:.1} MB", f / (K * K))
+    } else if f >= K {
+        format!("{:.0} KB", f / K)
+    } else {
+        format!("{n} B")
+    }
 }
 
 #[cfg(test)]

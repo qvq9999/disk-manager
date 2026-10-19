@@ -9,6 +9,7 @@ import {
 } from '../../services/api'
 import { DrivePicker } from './DrivePicker'
 import { EmptyArtIcon } from './EmptyArtIcon'
+import { useConfirm } from '../../components/ConfirmDialog'
 
 /**
  * 空文件夹清理
@@ -43,6 +44,9 @@ export function EmptyDirClean() {
   const [failed, setFailed] = useState(0)
 
   useEffect(() => () => { void cancelEmptyDirScan() }, [])
+
+  // 删除前的二次确认（自绘弹窗）
+  const { ask, node: confirmNode } = useConfirm()
 
   const selCount = sel.size
   const allOn = items.length > 0 && items.every((i) => sel.has(i.path))
@@ -85,11 +89,14 @@ export function EmptyDirClean() {
   const doDelete = async () => {
     const paths = [...sel]
     if (paths.length === 0) return
-    const ok = window.confirm(
-      `将删除 ${paths.length} 个空文件夹。\n\n` +
-      `只删除**完全空**的目录；如果某个目录在这期间被写入了内容，会自动跳过。\n` +
-      `删除后无法撤销（空目录本身不含数据）。\n\n确定继续？`,
-    )
+    const ok = await ask({
+      title: `删除 ${paths.length} 个空文件夹`,
+      subtitle: '只处理完全为空的目录',
+      stats: [{ label: '文件夹数量', value: `${paths.length} 个`, strong: true }],
+      warning: '删除后无法撤销（空目录本身不含数据）。',
+      note: '扫描后如果某个目录被写入了内容，会自动跳过，不会被连带删除。',
+      confirmText: '删除空文件夹',
+    })
     if (!ok) return
     setPhase('cleaning')
     setPct(0)
@@ -297,6 +304,8 @@ export function EmptyDirClean() {
           <AlertTriangle size={13} /> 有目录在扫描后又被写入内容，已按安全策略跳过
         </div>
       )}
+
+      {confirmNode}
     </div>
   )
 }

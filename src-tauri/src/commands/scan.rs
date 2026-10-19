@@ -6,6 +6,7 @@
 //!   —— 不用事件推送，避免高频 emit 拖慢遍历本身
 
 use serde::Serialize;
+use std::collections::HashMap;
 use std::fs;
 use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -22,7 +23,7 @@ static CANCEL: AtomicBool = AtomicBool::new(false);
 /// 是否有扫描任务正在运行（含刚启动尚未遍历的短暂窗口）
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 /// 已遍历的目录项总数（进度用）
-static ENTRIES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static ENTRIES: AtomicU64 = AtomicU64::new(0);
 /// 已进入的目录数（用于节流更新「当前目录」）
 static DIRS: AtomicU64 = AtomicU64::new(0);
 /// 当前所在目录（仅在内存中保留一份，避免每条目都分配字符串）
@@ -66,7 +67,7 @@ fn tick() -> bool {
 }
 
 #[inline]
-fn cancelled() -> bool {
+pub(crate) fn cancelled() -> bool {
     CANCEL.load(Ordering::Relaxed)
 }
 
@@ -448,9 +449,9 @@ fn reset_progress() {
     if let Ok(mut g) = CURRENT.lock() {
         g.clear();
     }
-    if let Ok(mut g) = SCANNING_LETTER.lock() {
-        g.clear();
-    }
+        if let Ok(mut g) = SCANNING_LETTER.lock() {
+            g.clear();
+        }
 }
 
 #[tauri::command]
@@ -474,15 +475,179 @@ fn scan_drive_impl(letter: String) -> Result<FileNode, String> {
     if !p.is_dir() {
         return Err(format!("盘符 {root} 不存在或不可访问"));
     }
-    let width = if is_ntfs(&root) { parallel_width() } else { 1 };
     if let Ok(mut g) = SCANNING_LETTER.lock() {
         *g = letter.to_uppercase();
     }
+
+    // 先走 $MFT：顺序读一遍元文件就能拿到全盘清单，比逐目录遍历快一个数量级。
+    // 失败最常见的原因是「非管理员」或「非 NTFS」，此时静默回退到遍历，功能不受影响。
+    match scan_via_mft(&letter) {
+        Ok(tree) => return Ok(tree),
+        Err(_) => { /* 回退到遍历 */ }
+    }
+
+    let width = if is_ntfs(&root) { parallel_width() } else { 1 };
     let ctx = ScanCtx::new(width);
     // 被中止时整份结果作废：残缺的目录树会给出错误的体积占比，比不给结果更糟。
     // scope 结束时会等待所有派发出去的线程收尾（它们也都在检查取消标志，不会久等）。
     std::thread::scope(|sc| build_node(sc, &ctx, &p, root, 0))
         .ok_or_else(|| SCAN_CANCELLED.to_string())
+}
+
+// ============ MFT 快速路径 ============
+
+/// 用 $MFT 枚举整盘并重建目录树。
+///
+/// 体积口径与遍历保持一致：文件取逻辑大小（$DATA 的 RealSize），目录自底向上累加；
+/// 硬链接按路径展开重复计算（和 `read_dir` 看到的一样）。
+fn scan_via_mft(letter: &str) -> Result<FileNode, String> {
+    let entries = super::mft::read_entries(letter)?;
+    // 读取中途被取消时 MFT 只读了一半，绝不能拿半份数据建树
+    if cancelled() {
+        return Err(SCAN_CANCELLED.to_string());
+    }
+    ENTRIES.store(entries.len() as u64, Ordering::Relaxed);
+
+    let mut by_parent: HashMap<u64, Vec<usize>> = HashMap::with_capacity(entries.len() / 4);
+    for (i, e) in entries.iter().enumerate() {
+        by_parent.entry(e.parent).or_default().push(i);
+    }
+
+    let root_name = format!("{}:\\", letter.trim_end_matches(':').to_uppercase());
+    let mut visited = 0usize;
+    let (node, _) = mft_build(
+        super::mft::root_id(),
+        root_name,
+        0,
+        &entries,
+        &by_parent,
+        &mut visited,
+    )
+    .ok_or_else(|| SCAN_CANCELLED.to_string())?;
+
+    // 合理性自检：MFT 解析一旦偏移写错，算出来的总量会离谱到几个数量级。
+    // 用「卷已用字节数」当尺子，落在合理区间才采信，否则退回遍历。
+    //
+    // 区间放宽到 0.5~1.5 倍是有原因的，两个口径本来就不完全等价：
+    // 小文件按簇分配、压缩/稀疏文件的逻辑大小与实际占用不同、硬链接按路径重复计数。
+    if let Some((used, _total)) = super::mft::volume_usage(letter) {
+        if used > 0 {
+            let ratio = node.size as f64 / used as f64;
+            if !(0.5..=1.5).contains(&ratio) {
+                return Err(format!(
+                    "MFT 结果与卷使用量差异过大（{ratio:.2} 倍），已回退到遍历"
+                ));
+            }
+        }
+    }
+
+    Ok(node)
+}
+
+/// 递归建树。返回 (节点, 该子树总体积)。
+///
+/// 到展示深度上限时不再展开，但体积仍按整棵子树算满 —— 与遍历路径的口径一致。
+fn mft_build(
+    id: u64,
+    name: String,
+    depth: usize,
+    entries: &[super::mft::MftEntry],
+    by_parent: &HashMap<u64, Vec<usize>>,
+    visited: &mut usize,
+) -> Option<(FileNode, u64)> {
+    let mut children: Vec<FileNode> = Vec::new();
+    let mut total: u64 = 0;
+
+    if let Some(list) = by_parent.get(&id) {
+        for &i in list {
+            *visited += 1;
+            if *visited % 256 == 0 && cancelled() {
+                return None;
+            }
+            let e = &entries[i];
+            if e.is_dir {
+                if depth + 1 >= MAX_DEPTH {
+                    let sz = mft_subtree_size(e.id, entries, by_parent, 0);
+                    total += sz;
+                    children.push(FileNode {
+                        name: e.name.clone(),
+                        kind: "dir".into(),
+                        size: sz,
+                        category: categorize(&e.name, true).into(),
+                        mtime: fmt_unix(e.mtime),
+                        children: None,
+                    });
+                } else {
+                    let (node, sz) = mft_build(e.id, e.name.clone(), depth + 1, entries, by_parent, visited)?;
+                    total += sz;
+                    children.push(node);
+                }
+            } else {
+                total += e.size;
+                children.push(FileNode {
+                    name: e.name.clone(),
+                    kind: "file".into(),
+                    size: e.size,
+                    category: categorize(&e.name, false).into(),
+                    mtime: fmt_unix(e.mtime),
+                    children: None,
+                });
+            }
+        }
+    }
+
+    children.sort_by(|a, b| b.size.cmp(&a.size));
+    if children.len() > MAX_CHILDREN {
+        let rest: Vec<FileNode> = children.split_off(MAX_CHILDREN - 1);
+        children.push(FileNode {
+            name: format!("（其余 {} 项）", rest.len()),
+            kind: "dir".into(),
+            size: rest.iter().map(|n| n.size).sum(),
+            category: "other".into(),
+            mtime: String::new(),
+            children: None,
+        });
+    }
+
+    Some((
+        FileNode {
+            category: categorize(&name, true).into(),
+            name,
+            kind: "dir".into(),
+            size: total,
+            mtime: String::new(),
+            children: Some(children),
+        },
+        total,
+    ))
+}
+
+/// 只算体积、不建节点（给深度上限处的兄弟节点用）。
+/// `depth` 兼作防环保护：MFT 理应无环，但脏数据不该让进程爆栈。
+fn mft_subtree_size(
+    id: u64,
+    entries: &[super::mft::MftEntry],
+    by_parent: &HashMap<u64, Vec<usize>>,
+    depth: usize,
+) -> u64 {
+    if depth > 64 {
+        return 0;
+    }
+    let Some(list) = by_parent.get(&id) else { return 0 };
+    let mut total = 0u64;
+    for &i in list {
+        let e = &entries[i];
+        if e.is_dir {
+            total += mft_subtree_size(e.id, entries, by_parent, depth + 1);
+        } else {
+            total += e.size;
+        }
+    }
+    total
+}
+
+fn fmt_unix(secs: u64) -> String {
+    fmt_time(&(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs)))
 }
 
 #[cfg(test)]
@@ -610,8 +775,7 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
-    /// 对同一棵树按不同线程上限各跑一次，打印耗时与加速比。
-    /// 每个宽度前先热身一次，尽量让比较落在「缓存已热」的同一条件下。
+    /// 对同一棵树按不同线程上限各跑一次，打印耗时与加速比。 每个宽度前先热身一次，尽量让比较落在「缓存已热」的同一条件下。
     ///
     /// `strict` 为真时要求各次扫描体积完全相等 —— 只对静态的合成树成立。
     fn bench_on(p: &Path, strict: bool) {
@@ -708,5 +872,70 @@ mod tests {
         assert!(overshoot < 5_000, "取消后仍遍历了 {overshoot} 项，检查点过粗");
         ACTIVE.store(false, Ordering::Release);
         reset_progress();
+    }
+
+    /// MFT 快速路径必须与遍历结果对得上。
+    ///
+    /// 需要管理员权限（读 $MFT 要打开卷设备），非管理员会直接 skip：
+    ///   cargo test --release --lib mft_matches -- --ignored --nocapture
+    /// 指定盘符：DM_MFT_TEST_DRIVE=D
+    #[test]
+    #[ignore = "需要管理员权限 + 真实 NTFS 盘"]
+    fn mft_matches_walkdir() {
+        let letter = std::env::var("DM_MFT_TEST_DRIVE").unwrap_or_else(|_| "C".into());
+        let letter = letter.trim_end_matches(':').to_uppercase();
+
+        let t0 = Instant::now();
+        let mft = match scan_via_mft(&letter) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("skip: MFT 不可用（{e}）—— 多半是没以管理员身份运行测试");
+                return;
+            }
+        };
+        let mft_time = t0.elapsed();
+
+        reset_progress();
+        let t1 = Instant::now();
+        let root = format!("{letter}:\\");
+        let ctx = ScanCtx::new(4);
+        let walk = std::thread::scope(|sc| {
+            build_node(sc, &ctx, &PathBuf::from(&root), root.clone(), 0)
+        })
+        .expect("遍历应成功");
+        let walk_time = t1.elapsed();
+
+        fn count(n: &FileNode) -> (usize, usize) {
+            let mut d = usize::from(n.kind == "dir");
+            let mut f = usize::from(n.kind == "file");
+            if let Some(cs) = &n.children {
+                for c in cs {
+                    let (dd, ff) = count(c);
+                    d += dd;
+                    f += ff;
+                }
+            }
+            (d, f)
+        }
+        let (md, mf) = count(&mft);
+        let (wd, wf) = count(&walk);
+
+        eprintln!(
+            "MFT  {:>10.2?}  {:>14} 字节  目录 {md}  文件 {mf}",
+            mft_time, mft.size
+        );
+        eprintln!(
+            "遍历 {:>10.2?}  {:>14} 字节  目录 {wd}  文件 {wf}",
+            walk_time, walk.size
+        );
+
+        // MFT 能看到「遍历因权限读不到」的目录里的内容，所以体积通常大于或等于遍历结果。
+        // 反过来若明显偏小，就是解析漏了东西。
+        let ratio = mft.size as f64 / walk.size.max(1) as f64;
+        eprintln!("体积比 {ratio:.4}（>1 属正常）");
+
+        assert!(ratio > 0.97, "MFT 比遍历小 {:.1}%，疑似漏解析", (1.0 - ratio) * 100.0);
+        assert!(ratio < 1.15, "MFT 比遍历大 {:.1}%，疑似重复计数", (ratio - 1.0) * 100.0);
+        assert!(md * 2 > wd, "MFT 目录数 {md} 远少于遍历 {wd}");
     }
 }

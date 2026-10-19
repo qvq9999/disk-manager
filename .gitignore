@@ -13,6 +13,12 @@ src-tauri/.cargo/config.toml
 .workbuddy/
 release/
 
+# ---------- 文档：只在本地保留，不进仓库 ----------
+# 仓库只放程序代码。CHANGELOG.md 仍会被 release.py 读取、并在构建时内联进安装包，
+# 只是不纳入版本管理；需求 / 技术 / 设计方案、软件介绍同理。
+*.md
+!README.md
+
 # ---------- 签名密钥（私钥一旦泄露，别人就能签出可被接受的更新包）----------
 *.key
 *.key.pub

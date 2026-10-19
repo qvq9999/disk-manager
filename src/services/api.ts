@@ -1,7 +1,7 @@
 // ============ 数据服务层（双模式） ============
 // Tauri 环境: invoke Rust 命令（真实数据）
 // 浏览器预览: 回落 Mock（与 Tauri 命令同契约）
-import type { Volume, FileNode, CleanCategory, InstalledApp, ResidualItem, HardwareInfo, PhysicalDisk, AppSettings, CloseAction, InstallerItem, EmptyDirItem, IdentifyResult, AiAnalysis, AiConfigPublic, AiMessage } from '../types'
+import type { Volume, FileNode, CleanCategory, InstalledApp, ResidualItem, HardwareInfo, PhysicalDisk, AppSettings, CloseAction, InstallerItem, EmptyDirItem, IdentifyResult, AiAnalysis, AiConfigPublic, AiMessage, AiBatchResult } from '../types'
 import { Channel } from '@tauri-apps/api/core'
 
 export const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
@@ -732,12 +732,25 @@ const MOCK_SETTINGS_KEY = 'dm.mock.settings'
 function mockSettings(): AppSettings {
   let closeAction: CloseAction = 'ask'
   let autostart = false
+  let autoAnalyzeLayer = false
+  let allowPageContext = true
+  // 预览环境同样先弹一次，方便验证免责声明交互；清 localStorage 即复位
+  let disclaimerAccepted = false
   try {
     const raw = localStorage.getItem(MOCK_SETTINGS_KEY)
     if (raw) {
-      const v = JSON.parse(raw) as { closeAction?: CloseAction; autostart?: boolean }
+      const v = JSON.parse(raw) as {
+        closeAction?: CloseAction
+        autostart?: boolean
+        autoAnalyzeLayer?: boolean
+        allowPageContext?: boolean
+        disclaimerAccepted?: boolean
+      }
       if (v.closeAction === 'ask' || v.closeAction === 'background' || v.closeAction === 'exit') closeAction = v.closeAction
       autostart = !!v.autostart
+      if (typeof v.autoAnalyzeLayer === 'boolean') autoAnalyzeLayer = v.autoAnalyzeLayer
+      if (typeof v.allowPageContext === 'boolean') allowPageContext = v.allowPageContext
+      if (typeof v.disclaimerAccepted === 'boolean') disclaimerAccepted = v.disclaimerAccepted
     }
   } catch { /* 隐私模式下 localStorage 不可用，用默认值 */ }
   return {
@@ -747,12 +760,15 @@ function mockSettings(): AppSettings {
     trayAvailable: true,
     appVersion: __APP_VERSION__,
     exePath: '（浏览器预览，无真实程序路径）',
+    autoAnalyzeLayer,
+    allowPageContext,
+    disclaimerAccepted,
   }
 }
 
-function mockWriteSettings(patch: Partial<{ closeAction: CloseAction; autostart: boolean }>) {
+function mockWriteSettings(patch: Partial<AppSettings>) {
   const cur = mockSettings()
-  const next = { closeAction: cur.closeAction, autostart: cur.autostart, ...patch }
+  const next = { ...cur, ...patch }
   try {
     localStorage.setItem(MOCK_SETTINGS_KEY, JSON.stringify(next))
   } catch { /* 忽略 */ }
@@ -771,8 +787,32 @@ export async function updateCloseAction(action: CloseAction): Promise<void> {
   await inv<void>('update_close_action', { action })
 }
 
-/** 返回写入后的真实状态（Rust 会回读注册表，不假设写成功） */
-export async function updateAutostart(enabled: boolean): Promise<boolean> {
+/** 更新 AI 相关的两个开关，返回写入后的真实状态 */
+export async function updatePrefs(patch: {
+  autoAnalyzeLayer?: boolean
+  allowPageContext?: boolean
+}): Promise<AppSettings> {
+  if (!isTauri) {
+    const cur = mockSettings()
+    mockWriteSettings({ ...cur, ...patch })
+    return { ...cur, ...patch }
+  }
+  return inv<AppSettings>('update_prefs', {
+    autoAnalyzeLayer: patch.autoAnalyzeLayer,
+    allowPageContext: patch.allowPageContext,
+  })
+}
+
+/** 记录「已阅读并同意免责声明」；返回写入后的真实状态 */
+export async function acceptDisclaimer(): Promise<boolean> {
+  if (!isTauri) {
+    mockWriteSettings({ disclaimerAccepted: true })
+    return true
+  }
+  return inv<boolean>('accept_disclaimer')
+}
+
+/** 返回写入后的真实状态（Rust 会回读注册表，不假设写成功） */export async function updateAutostart(enabled: boolean): Promise<boolean> {
   if (!isTauri) {
     mockWriteSettings({ autostart: enabled })
     return enabled
@@ -989,4 +1029,65 @@ export async function aiChat(messages: AiMessage[], context: string): Promise<st
     return '（浏览器预览环境没有真实模型）当前问题没有命中本地问答库。配置 AI 后可以问更复杂的问题。'
   }
   return inv<string>('ai_chat', { messages, context })
+}
+
+/**
+ * 流式问答：`onDelta` 每收到一小段就被调用一次，前端边收边渲染。
+ * 返回完整文本，用于在流结束时校正界面（丢包时以返回值为准）。
+ */
+export async function aiChatStream(
+  messages: AiMessage[],
+  context: string,
+  onDelta: (t: string) => void,
+): Promise<string> {
+  if (!isTauri) {
+    // 浏览器预览：模拟打字机，让渲染逻辑也能被验证
+    const demo =
+      '（浏览器预览环境没有真实模型）这是一段模拟的流式输出，' +
+      '用来验证逐字渲染、自动滚动和结束态是否正确。真实回答会由模型逐字推送。'
+    let acc = ''
+    for (const ch of demo) {
+      acc += ch
+      onDelta(ch)
+      await new Promise((r) => setTimeout(r, 16))
+    }
+    return acc
+  }
+  const { Channel } = await import('@tauri-apps/api/core')
+  const ch = new Channel<string>()
+  ch.onmessage = (t: string) => onDelta(t)
+  return inv<string>('ai_chat_stream', { messages, context, onChunk: ch })
+}
+
+/** 生成「接下来可能会问」的问题，失败时返回空数组（不打扰用户） */
+export async function aiSuggest(question: string, answer: string): Promise<string[]> {
+  if (!isTauri) {
+    return ['这个目录删了会怎样', '怎么安全地清理它']
+  }
+  try {
+    return await inv<string[]>('ai_suggest', { question, answer })
+  } catch {
+    return []
+  }
+}
+
+/** 一次分析同一层下的多个子项（比逐个调用省 token，且模型能看到同层其它项） */
+export async function aiAnalyzeBatch(items: {
+  name: string
+  path: string
+  kind: 'dir' | 'file'
+  size: number
+  summary: string
+}[]): Promise<AiBatchResult[]> {
+  if (!isTauri) {
+    await new Promise((r) => setTimeout(r, 900))
+    return items.map((i) => ({
+      name: i.name,
+      what: '（浏览器预览的模拟结论）未接入真实模型',
+      canDelete: 'unknown' as const,
+      consequence: '',
+      suggestion: '在真实环境中这里会是模型给出的判断',
+    }))
+  }
+  return inv<AiBatchResult[]>('ai_analyze_batch', { items })
 }

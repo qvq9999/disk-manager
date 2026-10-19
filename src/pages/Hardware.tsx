@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import {
   Cpu, MemoryStick, Monitor, CircuitBoard, HardDrive, MonitorCog, Volume2, Wifi,
   RefreshCw, Clock, Info,
@@ -7,6 +7,7 @@ import type { HardwareInfo } from '../types'
 import { getHardwareInfo, hardwareCacheInfo, peekHardwareInfo } from '../services/api'
 import { PageLoading } from '../components/Loading'
 import { fmtBytes } from '../utils/format'
+import { useAiPageContext } from '../services/aiContext'
 
 /**
  * 拼接并去重。
@@ -127,6 +128,61 @@ export function Hardware() {
   const [showMethods, setShowMethods] = useState(false)
   // 运行时间实时递增：以扫描时刻的 uptime 为基准 + 本地经过时间（不重新扫描）
   const [, forceTick] = useState(0)
+
+  /**
+   * 给 AI 的页面摘要：只放配置项本身。
+   * 刻意不含计算机名、机器码、任何含用户名的路径 —— 这些对回答「配置怎么样」没有帮助，
+   * 泄露出去却是实打实的隐私损失。
+   */
+  const aiSummary = useMemo(() => {
+    if (!info) return ''
+    const lines: string[] = []
+    if (info.cpu.name) {
+      const cores = [
+        info.cpu.coresPhysical ? `${info.cpu.coresPhysical} 核` : '',
+        info.cpu.coresLogical ? `${info.cpu.coresLogical} 线程` : '',
+      ].filter(Boolean).join(' ')
+      lines.push(
+        `处理器：${info.cpu.name}${cores ? `，${cores}` : ''}` +
+          (info.cpu.baseMhz ? `，基准 ${(info.cpu.baseMhz / 1000).toFixed(2)} GHz` : ''),
+      )
+    }
+    if (info.memory.totalBytes > 0) {
+      const sticks = info.memory.sticks
+        .map((s) => `${fmtBytes(s.capacityBytes, 0)}${s.configuredMhz ? `@${s.configuredMhz}MHz` : ''}`)
+        .join(' + ')
+      lines.push(
+        `内存：${fmtBytes(info.memory.totalBytes, 0)} ${info.memory.memType || ''}` +
+          (sticks ? `（${sticks}）` : ''),
+      )
+    }
+    if (info.gpu.length > 0) {
+      lines.push(
+        `显卡：${info.gpu
+          .map((g) => `${g.name}${g.vramBytes > 0 ? ` ${fmtBytes(g.vramBytes, 0)}显存` : ''}`)
+          .join(' / ')}`,
+      )
+    }
+    if (info.motherboard.product) {
+      lines.push(
+        `主板：${[info.motherboard.manufacturer, info.motherboard.product].filter(Boolean).join(' ')}` +
+          (info.motherboard.biosVersion ? `，BIOS ${info.motherboard.biosVersion}` : ''),
+      )
+    }
+    if (info.disks.length > 0) {
+      lines.push(
+        `硬盘：${info.disks
+          .map((d) => `${d.media || '未知'} ${fmtBytes(d.sizeBytes, 0)}${d.model ? ` ${d.model}` : ''}`)
+          .join('；')}`,
+      )
+    }
+    if (info.system.caption) {
+      lines.push(`系统：${info.system.caption.replace(/Microsoft\s*/i, '')} Build ${info.system.build}`)
+    }
+    return lines.join('\n').slice(0, 500)
+  }, [info])
+
+  useAiPageContext('hardware', aiSummary)
 
   const load = (force = false) => {
     setRefreshing(true)

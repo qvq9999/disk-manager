@@ -157,6 +157,8 @@ pub fn run() {
       commands::settings::get_app_settings,
       commands::settings::update_close_action,
       commands::settings::update_autostart,
+      commands::settings::update_prefs,
+      commands::settings::accept_disclaimer,
       commands::settings::resolve_close,
       commands::settings::show_main_window,
       commands::update::update_endpoint,
@@ -169,6 +171,9 @@ pub fn run() {
       commands::ai::ai_test_connection,
       commands::ai::ai_analyze,
       commands::ai::ai_chat,
+      commands::ai::ai_chat_stream,
+      commands::ai::ai_analyze_batch,
+      commands::ai::ai_suggest,
     ])
     .run(tauri::generate_context!())
     .expect("error while building tauri application");

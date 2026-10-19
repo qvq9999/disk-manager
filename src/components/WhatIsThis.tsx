@@ -3,8 +3,9 @@ import {
   Check, AlertTriangle, HelpCircle, Loader2, Sparkles, FolderOpen, Copy,
   ChevronDown, ChevronUp,
 } from 'lucide-react'
-import type { IdentifyResult, Verdict } from '../types'
+import type { AiAnalysis, FileNode, IdentifyResult, Verdict } from '../types'
 import { aiAnalyze, aiGetConfig, identifyNode, revealInExplorer } from '../services/api'
+import { LayerAnalysis } from './LayerAnalysis'
 
 const TONE: Record<Verdict, { color: string; bg: string; text: string }> = {
   safe: { color: 'var(--success)', bg: 'rgba(22,163,74,.07)', text: '可以清理' },
@@ -24,6 +25,14 @@ function VerdictIcon({ v }: { v: Verdict }) {
 const CONF_TEXT = ['', '依据有限', ''] as const
 
 /**
+ * AI 分析结果缓存。
+ *
+ * 同一个目录大小没变，结论就不会变；重复点「深度分析」只是白花额度。
+ * 用「路径 + 体积」作键：内容一变体积就变，缓存自然失效，不需要额外过期策略。
+ */
+const aiCache = new Map<string, AiAnalysis>()
+
+/**
  * 「这是什么 / 能不能删」卡片。
  *
  * 产品判断：用户真正要的不是文件格式，而是「这堆东西能不能删」。
@@ -36,11 +45,14 @@ export function WhatIsThis({
   path,
   kind,
   size,
+  siblings,
   onGotoClean,
 }: {
   path: string
   kind: 'dir' | 'file'
   size: number
+  /** 当前目录的直接子项，用于「分析这一层」；文件视图不传 */
+  siblings?: FileNode[]
   onGotoClean?: () => void
 }) {
   const [res, setRes] = useState<IdentifyResult | null>(null)
@@ -76,8 +88,30 @@ export function WhatIsThis({
     return () => { alive = false }
   }, [path, kind, size])
 
+  const aiCacheKey = `${kind}|${path}|${size}`
+
+  /** 把 AI 结论套到当前卡片上：只覆盖文案，不覆盖本地采集到的依据 */
+  const applyAi = (a: AiAnalysis, base: IdentifyResult) => {
+    setAiOpen(true)
+    setRes({
+      ...base,
+      source: 'ai',
+      what: a.what || base.what,
+      consequence: a.consequence || base.consequence,
+      verdict: a.canDelete,
+      label: base.label === '未能识别' || base.confidence === 0 ? (a.what.slice(0, 18) || base.label) : base.label,
+    })
+    if (a.suggestion) setRecall(a.suggestion)
+  }
+
   const runAi = async () => {
     if (!res || aiBusy) return
+    // 命中缓存就别再花一次额度
+    const hit = aiCache.get(aiCacheKey)
+    if (hit) {
+      applyAi(hit, res)
+      return
+    }
     // 没配置就别发一个注定失败的请求，直接告诉用户去哪儿配
     if (!aiOn) {
       setAiErr('还没有配置 AI。到「设置 - AI 助手」选一个服务商、填上 Key，回来后就能用深度分析。')
@@ -94,19 +128,12 @@ export function WhatIsThis({
         localLabel: res.label,
         localVerdict: res.verdict,
       })
-      setAiOpen(true)
-      // AI 结论只覆盖文案，不覆盖 local 的 evidence
-      setRes({
-        ...res,
-        source: 'ai',
-        what: a.what || res.what,
-        consequence: a.consequence || res.consequence,
-        verdict: a.canDelete,
-        label: res.label === '未能识别' || res.confidence === 0 ? (a.what.slice(0, 18) || res.label) : res.label,
-      })
-      if (a.suggestion) {
-        setRecall(a.suggestion)
+      aiCache.set(aiCacheKey, a)
+      if (aiCache.size > 60) {
+        const oldest = aiCache.keys().next().value
+        if (oldest) aiCache.delete(oldest)
       }
+      applyAi(a, res)
     } catch (e) {
       setAiErr(String((e as { message?: string })?.message ?? e))
     } finally {
@@ -138,6 +165,7 @@ export function WhatIsThis({
   }
 
   return (
+    <>
     <div className="what-card" style={{ borderLeftColor: tone.color, background: tone.bg }}>
       <div className="what-main">
         <div className="what-title-row">
@@ -239,6 +267,12 @@ export function WhatIsThis({
         </div>
       )}
     </div>
+
+    {kind === 'dir' && siblings && siblings.length > 1 && (
+      // key 用路径：切目录时强制重挂载，否则会留着上一层的分析结果
+      <LayerAnalysis key={path} basePath={path} items={siblings} aiOn={aiOn} />
+    )}
+    </>
   )
 }
 

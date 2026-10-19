@@ -11,6 +11,7 @@ import {
   peekCleanCategories, getLastCleanDrives, cleanFetchedAt,
 } from '../services/api'
 import { fmtBytes } from '../utils/format'
+import { useConfirm } from '../components/ConfirmDialog'
 import { InstallerClean } from './cleanup/InstallerClean'
 import { EmptyDirClean } from './cleanup/EmptyDirClean'
 import { EmptyArtIcon } from './cleanup/EmptyArtIcon'
@@ -88,6 +89,9 @@ function JunkScan() {
   const progressFrame = useRef(0)
   const pendingProgress = useRef<{ pct?: number; cur?: string }>({})
   const currentRef = useRef('')
+
+  // 危险操作二次确认（自绘弹窗，替代 window.confirm 的原生对话框）
+  const { ask, node: confirmNode } = useConfirm()
 
   const pushProgress = (pct?: number, cur?: string) => {
     if (pct !== undefined) pendingProgress.current.pct = pct
@@ -235,13 +239,20 @@ function JunkScan() {
     const chosenItems = items.filter((i) => sel.has(i.id))
     // 应用缓存只删目录内文件、保留目录本身，这一点必须在确认框里说清楚
     const hasAppCache = chosenItems.some((i) => i.id.startsWith('appcache:'))
-    const confirmText =
-      `将直接删除选中的 ${chosenItems.length} 类文件（共 ${fmtBytes(totalSel, 2)}），不进回收站且不可恢复。` +
-      (hasAppCache
-        ? '\n\n其中「应用缓存」只清空缓存目录内的文件，目录本身保留；应用下次启动会自动重建（首次打开可能略慢）。配置文件、登录数据与数据库会被自动跳过，个人设置不受影响。'
-        : '') +
-      '\n\n确定继续？'
-    if (!window.confirm(confirmText)) {
+    const ok = await ask({
+      title: `清理选中的 ${chosenItems.length} 类文件`,
+      subtitle: '确认后立即执行，不经过回收站',
+      stats: [
+        { label: '预计释放', value: fmtBytes(totalSel, 2), strong: true },
+        { label: '文件类别', value: `${chosenItems.length} 类` },
+      ],
+      warning: '删除后无法恢复，本程序不提供找回功能。',
+      note: hasAppCache
+        ? '其中「应用缓存」只清空缓存目录内的文件，目录本身保留；应用下次启动会自动重建（首次打开可能略慢）。配置文件、登录数据与数据库会被自动跳过，个人设置不受影响。'
+        : undefined,
+      confirmText: '确认清理',
+    })
+    if (!ok) {
       return
     }
     const snapshot = totalScanned // 清理前可清理总量
@@ -620,6 +631,9 @@ function JunkScan() {
               })}
         </div>
       )}
+
+      {/* 危险操作二次确认：自绘弹窗，替代原生 confirm */}
+      {confirmNode}
 
       {/* 说明：不再使用底部固定 toast —— 它会一直浮在列表上挡住内容，
           且与管理上方的「清理完成」摘要条信息重复 */}

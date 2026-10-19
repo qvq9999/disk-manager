@@ -56,7 +56,7 @@ function emit(r: UpdateCheckResult | null) {
 
 /** 更新源地址（用于设置页展示；与实际请求同源，见 tauri.conf.json） */
 export async function getUpdateEndpoint(): Promise<string> {
-  if (!isTauri) return 'https://github.com/OWNER/REPO/releases/latest/download/latest.json'
+  if (!isTauri) return 'https://github.com/qvq9999/disk-manager/releases/latest/download/latest.json'
   try {
     const { invoke } = await import('@tauri-apps/api/core')
     return await invoke<string>('update_endpoint')

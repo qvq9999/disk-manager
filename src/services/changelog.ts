@@ -1,11 +1,22 @@
 /**
- * 更新日志：直接读取仓库根目录的 CHANGELOG.md。
+ * 更新日志：读取仓库根目录的 CHANGELOG.md。
  *
  * 用 `?raw` 在构建时把文件内容内联进 bundle，因此**不需要联网也能看**——
  * 这比运行时请求 GitHub API 更可靠（离线、无 CORS、无速率限制），
  * 代价是发版时必须把说明写进 CHANGELOG.md（release.py 已自动完成这一步）。
+ *
+ * 这里用 `import.meta.glob` 而不是 `import raw from '...?raw'`：
+ * CHANGELOG.md 只留在本地、不进仓库（仓库只放程序代码），
+ * 静态 import 在文件缺失时会让整个构建失败；glob 取不到就是空数组，
+ * 版本缺口只表现为「更新日志为空」，而不是「程序编译不过」。
  */
-import raw from '../../CHANGELOG.md?raw'
+const files = import.meta.glob('../../CHANGELOG.md', {
+  query: '?raw',
+  import: 'default',
+  eager: true,
+}) as Record<string, string>
+
+const raw = Object.values(files)[0] ?? ''
 
 export interface ChangelogGroup {
   /** 分组名，如「新增」「修复」 */

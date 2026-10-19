@@ -1,13 +1,15 @@
 import { useEffect, useState } from 'react'
 import { Cpu, HardDrive, Trash2, Package, Sun, Moon, AlertTriangle, Menu, Settings as SettingsIcon } from 'lucide-react'
 import type { Page, Volume } from './types'
-import { getVolumes, peekVolumes, warmUp, isElevated, restartAsAdmin, onCloseRequested, peekDriveTree } from './services/api'
-import { startScan, getScanTask } from './services/scanTasks'
+import { getVolumes, getAppSettings, acceptDisclaimer, peekVolumes, warmUp, isElevated, restartAsAdmin, onCloseRequested } from './services/api'
+import { setPrefs } from './services/prefs'
 import { installNativeShell } from './services/native'
 import { checkForUpdate, subscribeUpdate, latestUpdate } from './services/update'
 import { ErrorBoundary } from './components/ErrorBoundary'
 import { CloseConfirm } from './components/CloseConfirm'
+import { DisclaimerModal } from './components/Disclaimer'
 import { AiAssistant } from './components/AiAssistant'
+import { fmtBytes } from './utils/format'
 import { Hardware } from './pages/Hardware'
 import { Overview } from './pages/Overview'
 import { DriveDetail } from './pages/DriveDetail'
@@ -45,6 +47,8 @@ export default function App() {
   const [menuOpen, setMenuOpen] = useState(false)
   // 点窗口 ✕ 时：Rust 已拦下关闭，由这里弹窗让用户选择「退到后台 / 直接关闭」
   const [closePrompt, setClosePrompt] = useState(false)
+  // 免责声明：first-run 为首次启动自动弹出，review 为用户从设置里主动打开
+  const [disc, setDisc] = useState<'first-run' | 'review' | null>(null)
 
   useEffect(() => {
     return onCloseRequested(() => setClosePrompt(true))
@@ -89,27 +93,15 @@ export default function App() {
   useEffect(() => {
     getVolumes().then(setVolumes).catch(() => setVolumes([]))
     isElevated().then(setAdmin).catch(() => setAdmin(false))
+    // AI 相关开关要在首屏就能被读到（空间分析会自动分析、AI 助手会读页面数据）
+    getAppSettings()
+      .then((s) => {
+        setPrefs({ autoAnalyzeLayer: s.autoAnalyzeLayer, allowPageContext: s.allowPageContext })
+        // 首次安装后的第一次进入才自动弹一次；确认状态由 Rust 侧持久化
+        if (!s.disclaimerAccepted) setDisc('first-run')
+      })
+      .catch(() => { /* 读不到就用默认值，且不拦截使用 */ })
   }, [])
-
-  // 启动预热：空闲时静默扫一遍系统盘。
-  //
-  // 全盘遍历要几十秒，用户点进「空间分析」后对着进度条干等，是最费体感的一处。
-  // 与其去抠那几十秒，不如把它挪到用户还没进页面的时候做掉。
-  // 约束：窗口可见才做、已有结果或任务就不重复、延迟 12 秒避开开机抢 IO。
-  useEffect(() => {
-    if (volumes.length === 0) return
-    const first = volumes.find((v) => v.letter.toUpperCase() === 'C') ?? volumes[0]
-    if (!first) return
-    const letter = first.letter.toUpperCase()
-    if (getScanTask(letter) || peekDriveTree(letter)) return
-
-    const t = window.setTimeout(() => {
-      if (document.visibilityState !== 'visible') return
-      if (getScanTask(letter) || peekDriveTree(letter)) return
-      void startScan(letter, false, true)
-    }, 12_000)
-    return () => window.clearTimeout(t)
-  }, [volumes])
 
   const elevate = async () => {
     try {
@@ -147,7 +139,7 @@ export default function App() {
       case 'drive': return drive ? <DriveDetail volume={drive} onBack={() => setPage('overview')} onGotoClean={() => setPage('clean')} /> : null
       case 'clean': return <Cleanup />
       case 'uninstall': return <Uninstall />
-      case 'settings': return <Settings onOpenAi={() => setPage('ai')} />
+      case 'settings': return <Settings onOpenAi={() => setPage('ai')} onOpenDisclaimer={() => setDisc('review')} />
       case 'ai': return <AiSettingsPage onBack={() => setPage('settings')} />
     }
   })()
@@ -244,10 +236,27 @@ export default function App() {
 
       {closePrompt && <CloseConfirm onCancel={() => setClosePrompt(false)} />}
 
+      {/* 免责声明：首次启动自动弹出（必须读到底部），之后只能从设置里主动查看 */}
+      {disc && (
+        <DisclaimerModal
+          mode={disc}
+          onClose={() => setDisc(null)}
+          onAccept={disc === 'first-run' ? async () => { await acceptDisclaimer() } : undefined}
+        />
+      )}
+
       {/* 全局 AI 助手：不占导航位，Ctrl+K 或点右下角圆球唤起 */}
       <AiAssistant
+        page={page}
         pageTitle={TITLES[page]}
         admin={admin}
+        diskContext={
+          volumes.length > 0
+            ? `磁盘：${volumes
+                .map((v) => `${v.letter}: 可用 ${fmtBytes(v.freeBytes, 1)} / 共 ${fmtBytes(v.totalBytes, 1)}`)
+                .join('；')}`
+            : ''
+        }
         onGotoSettings={() => setPage('settings')}
       />
     </div>

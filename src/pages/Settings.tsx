@@ -1,15 +1,16 @@
 import { useEffect, useState } from 'react'
 import {
-  HardDrive, Power, LayoutGrid, Trash2, Package, Cpu, Check, AlertTriangle,
-  Minimize2, LogOut, HelpCircle, FolderCog, RefreshCw, Loader2, Download,
-  ChevronDown, ChevronUp, ChevronRight, Sparkles,
+  HardDrive, Power, Check, AlertTriangle,
+  Minimize2, LogOut, HelpCircle, RefreshCw, Loader2, Download,
+  ChevronDown, ChevronUp, ChevronRight, Sparkles, ExternalLink, FileText,
 } from 'lucide-react'
 import type { AppSettings, CloseAction } from '../types'
-import { getAppSettings, updateAutostart, updateCloseAction } from '../services/api'
+import { getAppSettings, updateAutostart, updateCloseAction, updatePrefs, openExternal } from '../services/api'
+import { setPrefs, usePrefs } from '../services/prefs'
 import { CHANGELOG } from '../services/changelog'
 import {
   checkForUpdate, installPendingUpdate, latestUpdate, subscribeUpdate,
-  getUpdateEndpoint, type UpdateCheckResult, type DownloadProgress,
+  type UpdateCheckResult, type DownloadProgress,
 } from '../services/update'
 
 /** 开关控件（无原生 checkbox，纯 CSS 过渡，与整体视觉一致） */
@@ -88,24 +89,38 @@ const CLOSE_OPTIONS: { value: CloseAction; icon: typeof HelpCircle; title: strin
   },
 ]
 
-const FEATURES = [
-  { icon: LayoutGrid, name: '磁盘总览', desc: '分区容量与物理硬盘健康、SMART 寿命一览' },
-  { icon: FolderCog, name: '空间分析', desc: '目录树 + 矩形树图，定位占空间的大户' },
-  { icon: Trash2, name: '垃圾清理', desc: '按规则扫描可清理项，支持按盘符筛选' },
-  { icon: Package, name: '软件卸载', desc: '卸载后扫描残留（注册表 / 服务 / 计划任务）' },
-]
-
-export function Settings({ onOpenAi }: { onOpenAi: () => void }) {
+export function Settings({ onOpenAi, onOpenDisclaimer }: {
+  onOpenAi: () => void
+  /** 打开免责声明全文（只读回看，不再强制滚动） */
+  onOpenDisclaimer: () => void
+}) {
   const [s, setS] = useState<AppSettings | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
   const [autostartBusy, setAutostartBusy] = useState(false)
   const [actionBusy, setActionBusy] = useState<CloseAction | null>(null)
   const [notice, setNotice] = useState<{ tone: 'ok' | 'bad'; text: string } | null>(null)
+  const [prefBusy, setPrefBusy] = useState<'auto' | 'ctx' | null>(null)
+  const prefs = usePrefs()
+
+  /** 两个 AI 开关：写后端 + 同步到运行期 store，正在看空间分析的窗口会立刻生效 */
+  const togglePref = async (key: 'autoAnalyzeLayer' | 'allowPageContext') => {
+    if (prefBusy) return
+    setPrefBusy(key === 'autoAnalyzeLayer' ? 'auto' : 'ctx')
+    try {
+      const next = await updatePrefs({ [key]: !prefs[key] })
+      setPrefs({ autoAnalyzeLayer: next.autoAnalyzeLayer, allowPageContext: next.allowPageContext })
+      setS((old) => (old ? { ...old, ...next } : old))
+      setNotice({ tone: 'ok', text: '已保存' })
+    } catch (e) {
+      setNotice({ tone: 'bad', text: String((e as { message?: string })?.message ?? e) })
+    } finally {
+      setPrefBusy(null)
+    }
+  }
 
   // ---- 软件更新 ----
   const [upd, setUpd] = useState<UpdateCheckResult | null>(() => latestUpdate())
   const [updChecking, setUpdChecking] = useState(false)
-  const [endpoint, setEndpoint] = useState('')
   const [installing, setInstalling] = useState(false)
   const [dl, setDl] = useState<DownloadProgress | null>(null)
   const [installErr, setInstallErr] = useState('')
@@ -114,7 +129,6 @@ export function Settings({ onOpenAi }: { onOpenAi: () => void }) {
 
   useEffect(() => {
     let alive = true
-    getUpdateEndpoint().then((e) => { if (alive) setEndpoint(e) })
     // 启动时已检查过的话，这里直接复用；否则补一次静默检查
     const un = subscribeUpdate((r) => { if (alive) setUpd(r) })
     if (!latestUpdate()) {
@@ -206,42 +220,20 @@ export function Settings({ onOpenAi }: { onOpenAi: () => void }) {
 
   return (
     <div className="page-enter" style={{ maxWidth: 880 }}>
-      {/* ---------- 应用介绍 ---------- */}
-      <div className="panel" style={{ padding: '20px 22px', marginBottom: 20 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
-          <div className="quick-icon" style={{ width: 46, height: 46, background: 'var(--accent-soft)', color: 'var(--accent)' }}>
-            <HardDrive size={22} />
+      {/* ---------- 顶部标识 ----------
+          设置页的第一屏应该直接看到「能改什么」，而不是一大段产品介绍。
+          功能介绍放进「关于」里，位置在最后。 */}
+      <div className="panel" style={{ padding: '14px 18px', marginBottom: 18 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <div className="quick-icon" style={{ width: 38, height: 38, background: 'var(--accent-soft)', color: 'var(--accent)' }}>
+            <HardDrive size={19} />
           </div>
-          <div style={{ minWidth: 0 }}>
-            <div style={{ fontSize: 16, fontWeight: 600, letterSpacing: '-0.01em' }}>存储管理 Disk Manager</div>
-            <div style={{ fontSize: 11.5, color: 'var(--meta)', marginTop: 3 }}>
-              版本 {s.appVersion} · 适用于 Windows 10 / 11（需管理员权限以读取完整磁盘信息）
+          <div style={{ minWidth: 0, flex: 1 }}>
+            <div style={{ fontSize: 14.5, fontWeight: 600, letterSpacing: '-0.01em' }}>存储管理 Disk Manager</div>
+            <div style={{ fontSize: 11.5, color: 'var(--meta)', marginTop: 2 }}>
+              版本 {s.appVersion} · Windows 10 / 11{devPath ? ' · 开发版' : ''}
             </div>
           </div>
-        </div>
-
-        <p style={{ fontSize: 12.5, lineHeight: 1.85, color: 'var(--muted)', margin: '14px 0 0' }}>
-          一款面向本机的存储管理工具，把「谁在占空间」「什么可以删」「怎么安全卸载」三件事放在一处。
-          全部数据在本机读取，不上传任何信息；清理与卸载前均可预览明细，危险项会单独标注。
-        </p>
-
-        <div style={{
-          display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))',
-          gap: 10, marginTop: 16,
-        }}>
-          {FEATURES.map(({ icon: Icon, name, desc }) => (
-            <div key={name} style={{
-              display: 'flex', gap: 9, alignItems: 'flex-start',
-              padding: '10px 12px', borderRadius: 'var(--radius-md)',
-              background: 'var(--surface-warm)', border: '1px solid var(--border-soft)',
-            }}>
-              <Icon size={15} color="var(--accent)" style={{ flexShrink: 0, marginTop: 1 }} />
-              <div style={{ minWidth: 0 }}>
-                <div style={{ fontSize: 12.5, fontWeight: 600 }}>{name}</div>
-                <div style={{ fontSize: 11, color: 'var(--meta)', marginTop: 2, lineHeight: 1.55 }}>{desc}</div>
-              </div>
-            </div>
-          ))}
         </div>
       </div>
 
@@ -360,14 +352,38 @@ export function Settings({ onOpenAi }: { onOpenAi: () => void }) {
           <span className="ai-entry-body">
             <span className="ai-entry-title">AI 助手</span>
             <span className="ai-entry-desc">
-              内置额度默认可用，也可以换成自己的 Key 或本地 Ollama。
-              空间分析的「AI 深度分析」与右下角问答都用这里的配置。
+              内置额度默认可用，也可以换成自己的 Key 或本地 Ollama
             </span>
           </span>
           <span className="ai-entry-go">
             配置 <ChevronRight size={13} />
           </span>
         </button>
+
+        <Row
+          title="自动分析当前目录"
+          desc="默认关闭。打开后，每进入一个目录都会自动判断这一层最大的几项 —— 会持续消耗额度；关闭时可在页面里手动点「开始分析」。"
+        >
+          <Switch
+            checked={prefs.autoAnalyzeLayer}
+            disabled={prefBusy === 'auto'}
+            onChange={() => void togglePref('autoAnalyzeLayer')}
+            label="自动分析当前目录"
+          />
+        </Row>
+
+        <Row
+          title="让 AI 读取当前页面"
+          desc="允许把当前页面的数据摘要（CPU、内存、磁盘剩余、当前目录等）作为提问上下文。关掉后 AI 只知道你停留在哪个页面。"
+          last
+        >
+          <Switch
+            checked={prefs.allowPageContext}
+            disabled={prefBusy === 'ctx'}
+            onChange={() => void togglePref('allowPageContext')}
+            label="让 AI 读取当前页面"
+          />
+        </Row>
       </div>
 
       {/* ---------- 软件更新 ---------- */}
@@ -377,8 +393,8 @@ export function Settings({ onOpenAi }: { onOpenAi: () => void }) {
           title="当前版本"
           desc={
             <>
-              版本 {s.appVersion} · 检查更新会请求 GitHub Release 上的版本清单，
-              并用内置公钥校验安装包签名，签名不符的包会被拒绝安装。
+              当前安装版本 {s.appVersion}。检查更新会从官方仓库获取版本清单，
+              并校验安装包签名，签名不符的包不会被安装。
             </>
           }
         >
@@ -392,10 +408,6 @@ export function Settings({ onOpenAi }: { onOpenAi: () => void }) {
               ? <><Loader2 size={14} className="spin" /> 检查中…</>
               : <><RefreshCw size={14} /> 检查更新</>}
           </button>
-        </Row>
-
-        <Row title="更新源" desc={<span className="mono" style={{ wordBreak: 'break-all' }}>{endpoint || '读取中…'}</span>}>
-          <span />
         </Row>
 
         <Row title="自动检查" desc="每次启动后自动检查一次；发现新版本时侧边栏「设置」会出现提示点，不会弹出打扰。" last>
@@ -515,13 +527,51 @@ export function Settings({ onOpenAi }: { onOpenAi: () => void }) {
         </div>
       </div>
 
-      {/* ---------- 程序信息 ---------- */}
-      <div className="section-label">程序信息</div>
+      {/* ---------- 关于 ---------- */}
+      <div className="section-label">关于</div>
       <div className="panel">
+        <Row
+          title="这个工具做什么"
+          desc="把「谁在占空间」「什么可以删」「怎么安全卸载」放在一处。全部数据在本机读取，清理与卸载前可预览明细。"
+        >
+          <span />
+        </Row>
         <Row title="程序位置" desc={<span className="mono" style={{ wordBreak: 'break-all' }}>{s.exePath || '未知'}</span>}>
           <span />
         </Row>
-        <Row title="数据与隐私" desc="磁盘、注册表与软件信息全部在本机读取。只有你主动使用 AI 功能时，才会把路径、体积、扩展名分布这类摘要发给你选择的服务商，不含任何文件内容。" last>
+        <Row
+          title="GitHub 仓库"
+          desc={
+            <span className="mono" style={{ wordBreak: 'break-all' }}>
+              https://github.com/qvq9999/disk-manager
+            </span>
+          }
+        >
+          <button
+            className="btn btn-ghost"
+            style={{ padding: '4px 10px', fontSize: 12 }}
+            onClick={() => void openExternal('https://github.com/qvq9999/disk-manager')}
+          >
+            <ExternalLink size={12} /> 打开
+          </button>
+        </Row>
+        <Row
+          title="免责声明"
+          desc="清理与删除不可撤销、扫描结果可能误判、AI 输出仅供参考。首次启动时已弹出确认，这里可随时查看全文。"
+        >
+          <button
+            className="btn btn-ghost"
+            style={{ padding: '4px 10px', fontSize: 12 }}
+            onClick={onOpenDisclaimer}
+          >
+            <FileText size={12} /> 查看全文
+          </button>
+        </Row>
+        <Row
+          title="数据与隐私"
+          desc="磁盘、注册表与软件信息全部在本机读取。只有你主动使用 AI 时，才会把当前页面的摘要（路径、体积、配置项）发给你选择的服务商，不含任何文件内容。"
+          last
+        >
           <span />
         </Row>
       </div>

@@ -1,13 +1,13 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { MouseEvent as RMouseEvent } from 'react'
 import { ChevronRight, Folder, File as FileIcon, CornerLeftUp, RefreshCw, Square, AlertTriangle, X } from 'lucide-react'
-import type { Volume, FileNode, Category } from '../types'
+import type { Volume, FileNode } from '../types'
 import { peekDriveTree, revealInExplorer } from '../services/api'
 import { showContextMenu } from '../services/contextMenu'
 import { startScan, stopScan, isTaskRunning, getScanTask, markScanSeen, useScanTask } from '../services/scanTasks'
 import { fmtBytes } from '../utils/format'
-import { Treemap, TreemapLegend } from '../components/Treemap'
 import { ScanWaitCard } from '../components/ScanTask'
+import { useAiPageContext } from '../services/aiContext'
 import { WhatIsThis } from '../components/WhatIsThis'
 
 /** 拼绝对路径：盘根已带反斜杠，子项之间补一个 */
@@ -21,7 +21,6 @@ export function DriveDetail({ volume, onBack, onGotoClean }: { volume: Volume; o
   const task = useScanTask(letter)
 
   const [path, setPath] = useState<string[]>([])
-  const [hidden, setHidden] = useState<Set<Category>>(new Set())
   const [picked, setPicked] = useState<FileNode | null>(null)
 
   useEffect(() => {
@@ -58,7 +57,38 @@ export function DriveDetail({ volume, onBack, onGotoClean }: { volume: Volume; o
     return node
   }, [root, path])
 
-  // 从未拿到过结果（首次扫描 / 已停止 / 失败）→ 交给等待态卡片
+  const curPath = [`${volume.letter}:\\`, ...path]
+  /** 当前浏览到的绝对路径（盘根形如 `C:\`） */
+  const absPath = path.length === 0
+    ? `${volume.letter.toUpperCase()}:\\`
+    : `${volume.letter.toUpperCase()}:\\${path.join('\\')}`
+
+  const listItems = useMemo(
+    () => (cur ? [...(cur.children ?? [])].sort((a, b) => b.size - a.size) : []),
+    [cur],
+  )
+
+  /**
+   * 给 AI 的页面摘要：当前在哪一层、这层最大的几项。
+   * 只放路径与体积 —— 这些用户本来就在屏幕上看着，传出去不增加暴露面。
+   */
+  const aiSummary = useMemo(() => {
+    if (!cur) return ''
+    const kids = listItems.filter((n) => !n.name.startsWith('（其余 ')).slice(0, 5)
+    const lines = [`当前目录：${absPath}，共 ${fmtBytes(cur.size, 1)}`]
+    if (kids.length > 0) {
+      lines.push('这一层最大的几项：')
+      kids.forEach((n, i) => lines.push(`${i + 1}. ${n.name}，${fmtBytes(n.size, 1)}`))
+    }
+    return lines.join('\n').slice(0, 500)
+    // absPath / listItems 都由 cur 与 path 派生，依赖它们即可
+  }, [cur, listItems, absPath])
+  useAiPageContext('drive', aiSummary)
+
+  // ⚠️ 硬约束：下面这个早退之前不允许再出现任何 Hook。
+  // 首帧扫描还没结果时走早退（Hook 少），扫描完成后走完整渲染（Hook 多），
+  // 一旦把 Hook 写在早退后面，React 会抛 #310「渲染时调用的 Hook 比上次多」，
+  // 整页直接变成「此页面渲染出错」，只能重载恢复。
   if (!root || !cur) {
     return (
       <ScanWaitCard
@@ -70,21 +100,7 @@ export function DriveDetail({ volume, onBack, onGotoClean }: { volume: Volume; o
     )
   }
 
-  const curPath = [`${volume.letter}:\\`, ...path]
-  /** 当前浏览到的绝对路径（盘根形如 `C:\`） */
-  const absPath = path.length === 0
-    ? `${volume.letter.toUpperCase()}:\\`
-    : `${volume.letter.toUpperCase()}:\\${path.join('\\')}`
-
   const goUp = () => setPath((p) => p.slice(0, -1))
-  const toggleCat = (c: Category) =>
-    setHidden((s) => {
-      const n = new Set(s)
-      n.has(c) ? n.delete(c) : n.add(c)
-      return n
-    })
-
-  const listItems = [...(cur.children ?? [])].sort((a, b) => b.size - a.size)
   const canOpen = (n: FileNode) => n.kind === 'dir' && !!n.children && n.children.length > 0
 
   const enter = (name: string) => {
@@ -187,6 +203,9 @@ export function DriveDetail({ volume, onBack, onGotoClean }: { volume: Volume; o
           <span className="count">{fmtBytes(cur.size, 1)}</span>
         </div>
 
+        {/* 右侧不再是树图，改成 AI 分析的展示位；内容可能超出，需要独立滚动 */}
+        <div className="ai-scroll">
+
         {/* 选中文件时给出明确出口：卡片此时看的是这个文件，不是当前目录 */}
         {picked && (
           <div className="what-picked">
@@ -203,6 +222,7 @@ export function DriveDetail({ volume, onBack, onGotoClean }: { volume: Volume; o
           path={picked ? joinPath(absPath, picked.name) : absPath}
           kind={picked ? 'file' : 'dir'}
           size={picked ? picked.size : cur.size}
+          siblings={picked ? undefined : listItems}
           onGotoClean={onGotoClean}
         />
 
@@ -262,16 +282,7 @@ export function DriveDetail({ volume, onBack, onGotoClean }: { volume: Volume; o
             </button>
           </div>
         )}
-        <Treemap
-          node={cur}
-          hidden={hidden}
-          onOpen={(name) => {
-            const child = cur.children?.find((c) => c.name === name)
-            if (child && canOpen(child)) enter(name)
-          }}
-          onPickFile={setPicked}
-        />
-        <TreemapLegend hidden={hidden} onToggle={toggleCat} />
+        </div>
       </div>
     </div>
   )

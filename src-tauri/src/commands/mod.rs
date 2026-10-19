@@ -7,6 +7,7 @@ pub mod emptydir;
 pub mod hardware;
 pub mod identify;
 pub mod installer;
+pub mod mft;
 pub mod scan;
 pub mod settings;
 pub mod smart;

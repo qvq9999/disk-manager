@@ -15,6 +15,12 @@ export interface AppSettings {
   appVersion: string
   /** 当前程序路径（自启动指向的文件，便于确认是不是开发态路径） */
   exePath: string
+  /** 进入目录后自动分析这一层 */
+  autoAnalyzeLayer: boolean
+  /** 允许把当前页面数据摘要作为 AI 上下文 */
+  allowPageContext: boolean
+  /** 免责声明是否已确认；false 时首次进入会自动弹出一次 */
+  disclaimerAccepted: boolean
 }
 
 export interface Volume {
@@ -246,6 +252,15 @@ export interface IdentifyResult {
 export interface AiAnalysis {
   what: string
   canDelete: Verdict
+  consequence: string
+  suggestion: string
+}
+
+/** 整层批量分析的单条结果 */
+export interface AiBatchResult {
+  name: string
+  what: string
+  canDelete: 'safe' | 'caution' | 'danger' | 'unknown'
   consequence: string
   suggestion: string
 }

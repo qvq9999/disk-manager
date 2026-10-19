@@ -431,6 +431,111 @@ input:focus { outline: none; border-color: var(--accent); }
 @keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
 @keyframes modal-in { from { opacity: 0; transform: translateY(10px) scale(0.98); } to { opacity: 1; transform: none; } }
 
+/* ============ 免责声明弹窗 ============ */
+/*
+ * 与普通弹窗的区别：这里是「固定头尾 + 中间滚动」的三段结构。
+ * 滚动区域必须是独立的一层，否则滚到底的判定会落在外层容器上，
+ * 或者按钮跟着内容一起被滚走。
+ */
+.disc-panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.24);
+  width: min(640px, 100%);
+  max-height: 86vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  animation: modal-in 180ms cubic-bezier(0.2, 0, 0, 1);
+}
+.disc-head {
+  display: flex; align-items: center; gap: 11px; flex-shrink: 0;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.disc-badge {
+  width: 34px; height: 34px; border-radius: 10px; flex-shrink: 0;
+  display: grid; place-items: center;
+  background: var(--accent-soft); color: var(--accent);
+}
+.disc-body {
+  flex: 1; min-height: 0; overflow-y: auto;
+  padding: 16px 20px 6px;
+  /* 滚动条不遮挡正文 */
+  scrollbar-gutter: stable;
+}
+.disc-lead {
+  margin: 0 0 14px; font-size: 12.5px; line-height: 1.85; color: var(--fg-2);
+}
+.disc-sec { margin-bottom: 16px; }
+.disc-sec h4 { margin: 0 0 6px; font-size: 12.5px; font-weight: 600; color: var(--fg); }
+.disc-sec p { margin: 0 0 7px; font-size: 12px; line-height: 1.85; color: var(--muted); }
+.disc-sec p:last-child { margin-bottom: 0; }
+.disc-end {
+  display: flex; align-items: center; justify-content: center; gap: 5px;
+  padding: 8px 0 14px; font-size: 11px; color: var(--meta);
+}
+.disc-foot {
+  display: flex; align-items: center; gap: 12px; flex-shrink: 0;
+  padding: 12px 20px;
+  border-top: 1px solid var(--border-soft);
+  background: var(--surface);
+}
+.disc-hint { flex: 1; min-width: 0; font-size: 11.5px; line-height: 1.55; color: var(--warn); }
+.disc-hint.ready { color: var(--success); }
+
+/* ============ 危险操作确认弹窗（替代原生 confirm） ============ */
+.confirm-panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.24);
+  width: min(430px, 100%);
+  padding: 18px 20px 16px;
+  animation: modal-in 180ms cubic-bezier(0.2, 0, 0, 1);
+}
+.confirm-head { display: flex; align-items: flex-start; gap: 11px; }
+.confirm-badge {
+  width: 36px; height: 36px; border-radius: 11px; flex-shrink: 0;
+  display: grid; place-items: center;
+  background: rgba(220, 38, 38, 0.09);
+  border: 1px solid rgba(220, 38, 38, 0.16);
+  color: var(--danger);
+}
+.confirm-stats { display: flex; gap: 8px; margin-top: 14px; }
+.confirm-stat {
+  flex: 1; min-width: 0;
+  padding: 8px 11px;
+  border-radius: var(--radius-md);
+  background: var(--surface-warm);
+  border: 1px solid var(--border-soft);
+}
+.confirm-stat-label { display: block; font-size: 10.5px; color: var(--meta); }
+.confirm-stat-value {
+  display: block; margin-top: 2px;
+  font-size: 15px; font-weight: 600; letter-spacing: -0.01em;
+}
+.confirm-stat-value.strong { color: var(--danger); }
+.confirm-warn {
+  display: flex; align-items: flex-start; gap: 7px;
+  margin-top: 12px; padding: 9px 11px;
+  border-radius: var(--radius-md);
+  background: rgba(220, 38, 38, 0.06);
+  border: 1px solid rgba(220, 38, 38, 0.2);
+  font-size: 12px; line-height: 1.65; color: var(--fg-2);
+}
+.confirm-note {
+  margin-top: 9px; padding: 9px 11px;
+  border-radius: var(--radius-md);
+  background: var(--surface-warm);
+  border: 1px solid var(--border-soft);
+  font-size: 11.5px; line-height: 1.7; color: var(--muted);
+}
+.confirm-foot { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+
+
+
 /* ============ 清理页：两列独立布局（展开互不影响） ============ */
 /*
  * 卡片流式两列。
@@ -741,6 +846,9 @@ img, a { -webkit-user-drag: none; }
 .ai-foot {
   display: flex; gap: 8px; padding: 10px 12px; flex-shrink: 0;
   border-top: 1px solid var(--border-soft);
+}.ai-suggest {
+  display: flex; flex-wrap: wrap; gap: 6px;
+  padding: 0 12px 9px; flex-shrink: 0;
 }
 .ai-foot input {
   flex: 1; min-width: 0; padding: 8px 12px; border-radius: 9999px;
@@ -822,6 +930,51 @@ img, a { -webkit-user-drag: none; }
   display: flex; align-items: center; gap: 5px;
   font-size: 10.5px; color: var(--meta); margin-top: 5px;
 }
+
+/* 右侧内容区：取消树图后改放 AI 分析，内容可能很长，需要独立滚动 */
+.ai-scroll {
+  flex: 1; min-height: 0; overflow-y: auto;
+  display: flex; flex-direction: column;
+}
+
+/* ============ 整层批量分析 ============ */
+.layer-ai {
+  flex-shrink: 0; margin: 6px 12px 10px; padding: 8px 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+}
+.layer-head { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.layer-icon {
+  width: 20px; height: 20px; border-radius: 6px; flex-shrink: 0;
+  display: grid; place-items: center;
+  background: var(--surface-warm); color: var(--muted);
+}
+.layer-title { font-size: 12px; font-weight: 600; }
+.layer-sub { font-size: 11px; color: var(--meta); flex: 1; min-width: 0; }
+.layer-err {
+  display: flex; gap: 6px; margin-top: 7px; padding: 6px 9px;
+  border-radius: var(--radius-sm); background: rgba(217,119,6,.08);
+  color: var(--warn); font-size: 11.5px; line-height: 1.6;
+}
+.layer-rows {
+  display: flex; flex-direction: column; gap: 7px;
+  margin-top: 9px;
+}
+.layer-row { padding-top: 7px; border-top: 1px solid var(--border-soft); }
+.layer-row:first-child { border-top: none; padding-top: 0; }
+.layer-row-top { display: flex; align-items: center; gap: 8px; }
+.layer-name {
+  font-size: 12px; font-weight: 600; flex: 1; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.layer-size { font-size: 11px; color: var(--muted); flex-shrink: 0; }
+.layer-verdict {
+  font-size: 10.5px; padding: 0 6px; border-radius: 9999px;
+  border: 1px solid; line-height: 1.6; flex-shrink: 0;
+}
+.layer-what { font-size: 11.5px; color: var(--fg-2); line-height: 1.6; margin-top: 2px; }
+.layer-conseq { color: var(--meta); }
 
 /* 窄屏：面板收窄，球体贴近边缘 */
 @media (max-width: 640px) {
