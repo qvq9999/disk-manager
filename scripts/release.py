@@ -133,23 +133,40 @@ def repo_from_remote():
     return f'{m.group(1)}/{m.group(2)}' if m else None
 
 
-def push_with_token(token, repo):
+def push_with_token(token, repo, tag):
     """
-    推送主分支。
+    推送主分支与标签，返回 (是否成功, 输出)。
 
-    本机环境的两个坑（换机器时可能不存在，但保留这段逻辑不会有副作用）：
+    本机环境的几个坑（换机器时可能不存在，但保留这段逻辑不会有副作用）：
     1. 全局 gitconfig 有 `url.'https://ghproxy.net/https://github.com/'.insteadOf`，
        ghproxy 是只读加速代理，push 会报 "could not read Username"。
        → 把 token 写进 URL，前缀不再匹配 `https://github.com/`，自然绕过重写。
     2. 直连 github.com 时 schannel 报 CRYPT_E_NO_REVOCATION_CHECK（代理 MITM 证书无法查吊销），
        → GIT_SSL_NO_VERIFY=true。仅影响这一次推送，不写入任何配置。
+    3. **本地代理对 github.com:443 的 CONNECT 会返回 502**（实测 curl 走代理 502、直连 200），
+       而 git 会读 http_proxy 环境变量 → 必须显式清掉并置 NO_PROXY=*。
+    4. 标签是 `git tag -f` 建的**轻量标签**，`--follow-tags` 不会推它；
+       而 GitHub 在「tag 不存在时创建 Release」会自动把同名 tag 指到远端当前 HEAD
+       （实测指到了上一个版本），所以标签必须单独推、且允许强推纠正指向。
     """
     url = f'https://x-access-token:{token}@github.com/{repo}.git'
     env = os.environ.copy()
     env['GIT_SSL_NO_VERIFY'] = 'true'
     env['GIT_TERMINAL_PROMPT'] = '0'
-    out = sh(['git', 'push', url, 'HEAD:main', '--follow-tags'], check=False, env=env)
-    return out
+    for k in ('http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'all_proxy'):
+        env.pop(k, None)
+    env['NO_PROXY'] = '*'
+
+    out = ''
+    r1 = subprocess.run(['git', 'push', url, 'HEAD:main'], cwd=ROOT, capture_output=True,
+                        text=True, encoding='utf-8', errors='replace', env=env)
+    out += (r1.stdout or '') + (r1.stderr or '')
+    if r1.returncode != 0:
+        return False, out
+    r2 = subprocess.run(['git', 'push', '-f', url, f'refs/tags/{tag}'], cwd=ROOT, capture_output=True,
+                        text=True, encoding='utf-8', errors='replace', env=env)
+    out += (r2.stdout or '') + (r2.stderr or '')
+    return r2.returncode == 0, out
 
 
 def api(method, path, payload=None, token=None):
@@ -252,8 +269,14 @@ def main():
         sys.exit('缺少 GH_TOKEN，无法创建 Release。可先 git push，再手动上传 release/ 下的文件')
 
     print('[5/6] 推送代码与标签…')
-    push_out = push_with_token(token, repo)
-    print('  ' + (push_out.strip().splitlines()[-1] if push_out.strip() else '已推送'))
+    ok, push_out = push_with_token(token, repo, tag)
+    tail = push_out.strip().splitlines()[-1] if push_out.strip() else ''
+    print('  ' + tail)
+    if not ok:
+        # 关键：推送失败绝不能继续。之前这里只打印最后一行、照样建 Release，
+        # 结果出现「Release 有安装包、但仓库代码还是上一版、tag 指向旧提交」的半发布状态。
+        print(push_out[-1500:])
+        sys.exit('推送失败，Release 未创建。修好网络后**去掉 --bump** 重跑即可（产物已在 release/）')
 
     print('[6/6] 创建 Release 并上传…')
     try:
