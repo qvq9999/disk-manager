@@ -10,7 +10,7 @@ import { setPrefs, usePrefs } from '../services/prefs'
 import { CHANGELOG } from '../services/changelog'
 import {
   checkForUpdate, installPendingUpdate, latestUpdate, subscribeUpdate,
-  type UpdateCheckResult, type DownloadProgress,
+  RELEASES_PAGE, type UpdateCheckResult, type DownloadProgress,
 } from '../services/update'
 
 /** 开关控件（无原生 checkbox，纯 CSS 过渡，与整体视觉一致） */
@@ -457,9 +457,19 @@ export function Settings({ onOpenAi, onOpenDisclaimer }: {
               </button>
             </div>
           ) : upd?.error ? (
-            <div className="status-line" style={{ color: 'var(--warn)', lineHeight: 1.7, alignItems: 'flex-start' }}>
-              <AlertTriangle size={14} style={{ flexShrink: 0, marginTop: 3 }} />
-              <span>{upd.error}</span>
+            <div>
+              <div className="status-line" style={{ color: 'var(--warn)', lineHeight: 1.7, alignItems: 'flex-start' }}>
+                <AlertTriangle size={14} style={{ flexShrink: 0, marginTop: 3 }} />
+                <span>{upd.error}</span>
+              </div>
+              {/* 更新源全都不可达时，至少给用户一条能自己走通的路 */}
+              <button
+                className="btn btn-ghost"
+                style={{ padding: '5px 12px', fontSize: 12.5, marginTop: 10 }}
+                onClick={() => void openExternal(RELEASES_PAGE)}
+              >
+                <ExternalLink size={13} /> 在浏览器里下载
+              </button>
             </div>
           ) : upd ? (
             <div className="status-line" style={{ color: 'var(--success)' }}>

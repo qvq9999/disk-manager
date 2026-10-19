@@ -5,9 +5,13 @@
 //! 前端拿到 404 无法判断是「仓库没发布」还是「你忘了改配置」。
 
 /// ⚠️ 必须与 `tauri.conf.json` → `plugins.updater.endpoints[0]` 保持一致。
-/// 这里只用于**展示与判断是否已配置**，真正的请求由插件按配置发起。
+/// 这里只用于**判断是否已配置**，真正的请求由插件按配置的端点列表依次尝试。
+///
+/// 为什么第一位是镜像：GitHub 的 Release 资产会 302 到 `release-assets.githubusercontent.com`，
+/// 该域名在部分网络下被静默丢包（实测直连与代理都超时 20s+），而镜像站是直接回源转发字节，
+/// 1 秒内就能拿到。安装包本身还有签名校验，镜像即使被投毒也无法通过验证。
 pub const ENDPOINT: &str =
-    "https://github.com/qvq9999/disk-manager/releases/latest/download/latest.json";
+    "https://ghproxy.net/https://github.com/qvq9999/disk-manager/releases/latest/download/latest.json";
 
 /// 配置里是否还留着占位符（用户还没填自己的仓库）
 pub const PLACEHOLDER: &str = "OWNER/REPO";
@@ -75,8 +79,12 @@ mod tests {
     fn 更新源指向真实仓库() {
         // 必须是可匿名访问的地址：私有仓库的 Release 资产需要认证，
         // 客户端没有 token，自动更新会直接失效
-        assert!(ENDPOINT.starts_with("https://github.com/"));
+        assert!(ENDPOINT.starts_with("https://"), "更新源必须是 https");
         assert!(ENDPOINT.ends_with("/latest.json"));
+        assert!(
+            ENDPOINT.contains("github.com/qvq9999/disk-manager/releases/"),
+            "更新源必须指向真实仓库的 Release 资产"
+        );
         // 已配置真实地址后不应再命中占位符，否则设置页会一直提示「未配置」
         assert!(
             !ENDPOINT.contains(PLACEHOLDER),

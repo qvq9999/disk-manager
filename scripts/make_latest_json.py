@@ -32,6 +32,17 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NSIS_DIR = os.path.join(ROOT, 'src-tauri', 'target', 'release', 'bundle', 'nsis')
 OUT_DIR = os.path.join(ROOT, 'release')
 
+# 安装包下载地址走镜像，而不是 github.com 直链。
+#
+# 原因：GitHub 的 Release 资产会 302 到 release-assets.githubusercontent.com，
+# 这个域名在部分网络下被静默丢包（实测直连与代理都超时 20s 以上），
+# 于是「检查到新版本」之后一按下载就卡死。镜像站是直接回源转发字节，
+# 客户端只和镜像的域名握手，不受该域名可达性影响。
+#
+# 安全性不依赖镜像：清单里的 signature 由编译进程序的公钥校验，
+# 镜像即使被投毒，改过的包也过不了签名校验。
+MIRROR_PREFIX = 'https://ghproxy.net/'
+
 
 def find_artifacts():
     """返回 (setup.exe 路径, sig 路径)"""
@@ -68,6 +79,11 @@ def main():
     ap.add_argument('--notes', default='', help='更新说明（支持换行）')
     ap.add_argument('--tag', default=None, help='Release tag，默认 v<版本号>')
     ap.add_argument('--draft-ok', action='store_true', help='仅生成文件，不检查 URL 可达性')
+    ap.add_argument(
+        '--direct-url',
+        action='store_true',
+        help='安装包地址用 github.com 直链（默认走镜像，见脚本顶部 MIRROR_PREFIX 的说明）',
+    )
     args = ap.parse_args()
 
     if not re.fullmatch(r'[\w.-]+/[\w.-]+', args.repo):
@@ -83,7 +99,8 @@ def main():
     if not signature:
         sys.exit('签名文件是空的，构建可能没真正签名')
 
-    url = f'https://github.com/{args.repo}/releases/download/{tag}/{exe_name}'
+    direct = f'https://github.com/{args.repo}/releases/download/{tag}/{exe_name}'
+    url = direct if args.direct_url else MIRROR_PREFIX + direct
     sha256 = hashlib.sha256(open(exe, 'rb').read()).hexdigest()
 
     latest = {

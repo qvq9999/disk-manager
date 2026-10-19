@@ -34,6 +34,21 @@ let pendingUpdate: unknown = null
 let inflight: Promise<UpdateCheckResult> | null = null
 const listeners = new Set<(r: UpdateCheckResult | null) => void>()
 
+/**
+ * 单次检查的超时。
+ *
+ * 原来不设超时：GitHub 的下载域名（release-assets / objects.githubusercontent.com）
+ * 在部分网络下会被静默丢包，reqwest 会一直等到系统 TCP 超时（20 秒以上，还要乘上
+ * 地址数量），用户看到的就是「检查更新一直转圈」。
+ * 现在每个更新源最多等 7 秒，失败就换下一个（镜像在 1 秒内就能返回）。
+ */
+const CHECK_TIMEOUT_MS = 7_000
+/** 安装包下载超时：4 MB 左右，给足 3 分钟，避免慢速网络被误判成失败 */
+const DOWNLOAD_TIMEOUT_MS = 180_000
+
+/** 手动下载兜底地址（更新源全都不可用时，让用户在浏览器里自己下） */
+export const RELEASES_PAGE = 'https://github.com/qvq9999/disk-manager/releases/latest'
+
 export function subscribeUpdate(fn: (r: UpdateCheckResult | null) => void): () => void {
   listeners.add(fn)
   return () => listeners.delete(fn)
@@ -111,7 +126,8 @@ async function doCheck(): Promise<UpdateCheckResult> {
 
   try {
     const { check } = await import('@tauri-apps/plugin-updater')
-    const update = await check()
+    // 必须显式给 timeout：插件默认不超时，遇到被丢包的域名会一直挂着
+    const update = await check({ timeout: CHECK_TIMEOUT_MS })
     if (!update) {
       const r: UpdateCheckResult = {
         available: false,
@@ -154,8 +170,22 @@ function friendlyError(msg: string): string {
   if (m.includes('signature') || m.includes('verify')) {
     return '更新包签名校验失败，已拒绝安装（可能是更新源被篡改，或公钥与私钥不匹配）'
   }
-  if (m.includes('dns') || m.includes('connect') || m.includes('network') || m.includes('timeout')) {
-    return '无法连接更新服务器，请检查网络后重试'
+  if (m.includes('certificate') || m.includes('tls') || m.includes('ssl')) {
+    return '与更新服务器的 TLS 握手失败（常见于代理做了证书拦截）。关掉代理的 HTTPS 解密后重试'
+  }
+  if (m.includes('timed out') || m.includes('timeout')) {
+    return '连接更新服务器超时。当前网络可能无法访问 GitHub 的下载域名，可稍后重试或手动下载安装包'
+  }
+  // reqwest 的连接失败统一是 "error sending request for url (...)"，
+  // 原始文案对用户没有任何信息量，必须替换掉
+  if (
+    m.includes('error sending request') ||
+    m.includes('connect') ||
+    m.includes('dns') ||
+    m.includes('network') ||
+    m.includes('unreachable')
+  ) {
+    return '连不上更新服务器：当前网络访问 GitHub 下载域名（release-assets.githubusercontent.com）被拦截或超时。可以稍后重试，或手动下载安装包覆盖安装'
   }
   return msg
 }
@@ -192,7 +222,7 @@ export async function installPendingUpdate(
 
   // 结构由插件定义，这里只用到 downloadAndInstall
   const update = pendingUpdate as {
-    downloadAndInstall: (cb: (ev: unknown) => void) => Promise<void>
+    downloadAndInstall: (cb: (ev: unknown) => void, options?: { timeout?: number }) => Promise<void>
   }
 
   let total = 0
@@ -211,7 +241,7 @@ export async function installPendingUpdate(
     } else if (e.event === 'Finished') {
       onProgress?.({ downloaded: total, total, pct: 100 })
     }
-  })
+  }, { timeout: DOWNLOAD_TIMEOUT_MS })
 }
 
 /** 清掉缓存（例如用户点了「稍后再说」） */
