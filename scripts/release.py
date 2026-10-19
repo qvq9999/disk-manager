@@ -15,6 +15,7 @@
     python scripts/release.py --bump --notes "..." --dry-run        # 只打印计划
 """
 import argparse
+import base64
 import json
 import os
 import re
@@ -169,6 +170,59 @@ def push_with_token(token, repo, tag):
     return r2.returncode == 0, out
 
 
+def push_via_api(repo, token, tag):
+    """
+    git 推不动时的兜底：直接用 Git Data API 建提交。
+
+    本机 github.com:443 经常整个不可达（git push 直接超时），但 api.github.com
+    与 uploads.github.com 是通的。Git Data API 只需要 repo 权限：
+    建 blob → 建 tree → 建 commit → 改 ref，效果与 push 一致。
+    """
+    ref = api('GET', f'/repos/{repo}/git/ref/heads/main', token=token)
+    base = ref['object']['sha']
+    tree = api('GET', f'/repos/{repo}/git/commits/{base}', token=token)['tree']['sha']
+
+    diff = sh(['git', 'diff', '--name-status', base, 'HEAD'], check=False)
+    entries = []
+    for line in diff.splitlines():
+        parts = [x for x in line.split('\t') if x != '']
+        if len(parts) < 2:
+            continue
+        st, path = parts[0], parts[-1]
+        if st.startswith('D'):
+            entries.append({'path': path.replace('\\', '/'), 'mode': '100644',
+                            'type': 'blob', 'sha': None})
+            continue
+        local = os.path.join(ROOT, path)
+        if not os.path.isfile(local):
+            continue
+        mode = '100755' if os.access(local, os.X_OK) else '100644'
+        with open(local, 'rb') as f:
+            content = base64.b64encode(f.read()).decode()
+        blob = api('POST', f'/repos/{repo}/git/blobs',
+                   {'content': content, 'encoding': 'base64'}, token=token)
+        entries.append({'path': path.replace('\\', '/'), 'mode': mode,
+                        'type': 'blob', 'sha': blob['sha']})
+    if not entries:
+        return False, '没有检测到需要提交的改动'
+
+    new_tree = api('POST', f'/repos/{repo}/git/trees',
+                   {'base_tree': tree, 'tree': entries}, token=token)
+    msg = sh(['git', 'log', '-1', '--pretty=%B'], check=False).strip() or f'release: {tag}'
+    commit = api('POST', f'/repos/{repo}/git/commits',
+                 {'message': msg, 'tree': new_tree['sha'], 'parents': [base]}, token=token)
+    api('PATCH', f'/repos/{repo}/git/refs/heads/main',
+        {'sha': commit['sha'], 'force': True}, token=token)
+
+    try:
+        api('POST', f'/repos/{repo}/git/refs',
+            {'ref': f'refs/tags/{tag}', 'sha': commit['sha']}, token=token)
+    except RuntimeError:
+        api('PATCH', f'/repos/{repo}/git/refs/tags/{tag}',
+            {'sha': commit['sha'], 'force': True}, token=token)
+    return True, f'已通过 API 推送 {len(entries)} 个文件（{commit["sha"][:7]}）'
+
+
 def api(method, path, payload=None, token=None):
     url = path if path.startswith('http') else 'https://api.github.com' + path
     headers = {
@@ -272,6 +326,16 @@ def main():
     ok, push_out = push_with_token(token, repo, tag)
     tail = push_out.strip().splitlines()[-1] if push_out.strip() else ''
     print('  ' + tail)
+    if not ok:
+        # 本机常见：github.com:443 整段不可达，但 api.github.com 正常。
+        print('  git 推送不通，改走 GitHub API…')
+        try:
+            ok, out = push_via_api(repo, token, tag)
+            print('  ' + out)
+            push_out = out
+        except Exception as e:  # noqa: BLE001
+            ok = False
+            push_out = f'{push_out}\nAPI 兜底也失败：{e}'
     if not ok:
         # 关键：推送失败绝不能继续。之前这里只打印最后一行、照样建 Release，
         # 结果出现「Release 有安装包、但仓库代码还是上一版、tag 指向旧提交」的半发布状态。
