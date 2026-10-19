@@ -337,32 +337,19 @@ pub fn delete_contents<F: FnMut(u64)>(dir: &Path, freed: &mut u64, failed: &mut 
             files.push(e.path().to_path_buf());
         }
     }
-    for f in files {
+    for (i, f) in files.into_iter().enumerate() {
+        if i % 256 == 0 && super::clean::cancel_requested() {
+            return;
+        }
         let sz = f.metadata().map(|m| m.len()).unwrap_or(0);
-        match std::fs::remove_file(&f) {
-            Ok(()) => {
-                *freed += sz;
-                on_file(*freed);
-            }
-            Err(_) => {
-                // 只读属性是缓存文件的常见情况，清掉属性再试一次
-                if clear_readonly(&f) && std::fs::remove_file(&f).is_ok() {
-                    *freed += sz;
-                    on_file(*freed);
-                } else {
-                    *failed += 1;
-                }
-            }
+        // fsx：清只读 → 权限拒绝时修 ACL 重试（缓存目录里这两种情况很常见）
+        if super::fsx::remove_file_lenient(&f) {
+            *freed += sz;
+            on_file(*freed);
+        } else {
+            *failed += 1;
         }
     }
-}
-
-fn clear_readonly(p: &Path) -> bool {
-    let Ok(md) = std::fs::metadata(p) else { return false };
-    let mut perm = md.permissions();
-    #[allow(clippy::permissions_set_readonly_false)]
-    perm.set_readonly(false);
-    std::fs::set_permissions(p, perm).is_ok()
 }
 
 #[cfg(test)]

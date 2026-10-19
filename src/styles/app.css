@@ -534,6 +534,38 @@ input:focus { outline: none; border-color: var(--accent); }
 }
 .confirm-foot { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
 
+/* ---- 三态任务弹窗（v1.3.6）：确认 → 执行 → 结果 ---- */
+/*
+ * 进度块固定宽度、当前路径单行省略：
+ * 之前进度画在页面上时，宽度会随"正在删的路径"长度变化，把右侧按钮推来推去。
+ * 放进弹窗后弹窗宽度是固定的，路径再长也只影响省略号，不会动布局。
+ */
+.confirm-progress {
+  margin-top: 14px;
+  padding: 12px 13px;
+  border-radius: var(--radius-md);
+  background: var(--surface-warm);
+  border: 1px solid var(--border-soft);
+}
+.confirm-progress .progress-track { width: 100%; flex: unset; }
+.confirm-progress-meta {
+  display: flex; align-items: center; gap: 8px;
+  margin-top: 8px; font-size: 11.5px; color: var(--muted);
+}
+.confirm-progress-current {
+  flex: 1; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* 不确定进度：来回流动，不谎报百分比 */
+.progress-fill.indeterminate {
+  width: 40% !important;
+  animation: indeterminate 1.1s ease-in-out infinite;
+}
+@keyframes indeterminate {
+  0% { margin-left: -40%; }
+  100% { margin-left: 100%; }
+}
+
 
 
 /* ============ 清理页：两列独立布局（展开互不影响） ============ */

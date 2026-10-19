@@ -103,14 +103,38 @@ export type ResidualType =
   | 'firewall'   // 防火墙规则
   | 'pathenv'    // PATH 环境变量残留段
   | 'class'      // COM / 文件关联注册表键
+  | 'uninstallkey' // 卸载登记残项（软件没了但注册表条目还在）
 
 export interface ResidualItem {
+  /** `"{kind}|{payload}"`，payload 是后端编码的真实目标，前端不要解析或改写 */
   id: string
   path: string
   type: ResidualType
   size: number
   selected: boolean
   detail?: string // 残留内容明细
+  /** 匹配置信度 0~100：>=60 才是默认勾选项，40~59 为「疑似」 */
+  confidence?: number
+  /** 清理后回填 */
+  pendingReboot?: boolean
+  reason?: string
+}
+
+/** 残留清理的逐项结果：只有它才能说清「哪一项没删掉、为什么」 */
+export interface CleanItemResult {
+  path: string
+  ok: boolean
+  freed: number
+  pendingReboot: boolean
+  reason?: string
+}
+
+export interface CleanReport {
+  freed: number
+  ok: number
+  failed: number
+  pendingReboot: number
+  items: CleanItemResult[]
 }
 
 // ---- 物理硬盘（含 SMART 寿命） ----

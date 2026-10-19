@@ -10,9 +10,27 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::clean_rules::{self, Cat, RULES, USED_FILES};
 use super::app_cache;
+use super::fsx;
+
+/// 清理取消标志。清理可能涉及几万个文件，用户点「停止」后必须能真的停下来，
+/// 而不是等它把当前分类全部删完。检查点放在循环里（每 256 个文件一次），
+/// 单次开销可以忽略，但响应延迟能压到毫秒级。
+static CANCEL: AtomicBool = AtomicBool::new(false);
+
+/// 供 clean_rules / app_cache 的删除循环查询
+pub(crate) fn cancel_requested() -> bool {
+    CANCEL.load(Ordering::Relaxed)
+}
+
+/// 前端点「停止清理」时调用
+#[tauri::command]
+pub fn cancel_clean() {
+    CANCEL.store(true, Ordering::SeqCst);
+}
 
 /// 扫描范围：用户勾选的盘符（如 ["C","E"]）；为空表示按默认全盘
 #[derive(Deserialize, Clone)]
@@ -313,13 +331,26 @@ pub async fn run_clean(
     // 前端已知的待清理总量。传了就跳过「清理前再扫一遍」——
     // 深度扫描加入后这次重扫要 1~4 秒，白等没有意义（它只影响进度百分比）
     expected_total: Option<u64>,
-) -> Result<(u64, u32), String> {
+) -> Result<CleanOutcome, String> {
     let drives = scope.map(|s| s.drives).unwrap_or_default();
+    CANCEL.store(false, Ordering::SeqCst);
     tauri::async_runtime::spawn_blocking(move || {
         run_clean_impl(ids, &drives, &on_progress, expected_total)
     })
     .await
     .map_err(|e| format!("清理任务失败: {e}"))?
+}
+
+/// 清理结果。
+///
+/// `cancelled` 必须单独回报：用户中途停止时，界面既要展示**已释放多少**（真删了就是真删了），
+/// 又不能把"没处理完"说成"清理完成"。
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanOutcome {
+    pub freed: u64,
+    pub failed: u32,
+    pub cancelled: bool,
 }
 
 /// id 形态：全局规则 `rule.id`；逐盘规则 `rule.id:盘符`
@@ -338,7 +369,7 @@ fn run_clean_impl(
     drives: &[String],
     on_progress: &tauri::ipc::Channel<serde_json::Value>,
     expected_total: Option<u64>,
-) -> Result<(u64, u32), String> {
+) -> Result<CleanOutcome, String> {
     let letters = effective_drives(drives);
     // 总量只用于进度百分比：前端能给出就不必再全量扫一遍
     let total: u64 = match expected_total {
@@ -353,11 +384,18 @@ fn run_clean_impl(
 
     let mut freed = 0u64;
     let mut failed = 0u32;
+    let mut cancelled = false;
+    let item_total = ids.len() as u32;
 
-    for id in &ids {
+    for (idx, id) in ids.iter().enumerate() {
+        if cancel_requested() {
+            cancelled = true;
+            break;
+        }
         if id.starts_with("used:") {
             continue; // 只读项，永不删除
         }
+        let done = idx as u32;
         // 应用缓存：id 形如 `appcache:C:\...\Cache|C:\...\Code Cache`
         // 每条路径都重新过 app_cache::path_allowed（白名单目录名 + 黑名单路径段 + 必须在用户目录下），
         // 只删目录内文件、保留目录本身
@@ -366,8 +404,14 @@ fn run_clean_impl(
                 "pct": if total > 0 { ((freed * 100 / total) as u32).min(99) } else { 0 },
                 "current": "正在清理应用缓存",
                 "freed": freed,
+                "done": done,
+                "total": item_total,
             }));
             for one in raw.split('|') {
+                if cancel_requested() {
+                    cancelled = true;
+                    break;
+                }
                 let target = std::path::PathBuf::from(one);
                 if !app_cache::path_allowed(&target) {
                     failed += 1;
@@ -381,6 +425,8 @@ fn run_clean_impl(
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_default(),
                         "freed": f,
+                        "done": done,
+                        "total": item_total,
                     }));
                 });
             }
@@ -399,15 +445,18 @@ fn run_clean_impl(
                     target.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
                 ),
                 "freed": freed,
+                "done": done,
+                "total": item_total,
             }));
             if !target.is_absolute() || !target.is_dir() || !clean_rules::residual_path_allowed(&target) {
                 failed += 1;
                 continue;
             }
-            let (size, _) = clean_rules::dir_size_and_files(&target, 64);
-            match std::fs::remove_dir_all(&target) {
-                Ok(()) => freed += size,
-                Err(_) => failed += 1,
+            // 走 fsx：清只读 → 权限修复重试；`freed` 只按**实际删掉**的字节计
+            let r = fsx::remove_dir(&target);
+            freed += r.freed;
+            if !r.ok {
+                failed += 1;
             }
             continue;
         }
@@ -417,15 +466,23 @@ fn run_clean_impl(
             "pct": if total > 0 { ((freed * 100 / total) as u32).min(99) } else { 0 },
             "current": format!("正在清理 {}", rule.name),
             "freed": freed,
+            "done": done,
+            "total": item_total,
         }));
         clean_rules::delete_rule(rule, drive, &mut freed, &mut failed, |f, name| {
             let _ = on_progress.send(serde_json::json!({
                 "pct": if total > 0 { ((f * 100 / total) as u32).min(99) } else { 0 },
                 "current": name,
                 "freed": f,
+                "done": done,
+                "total": item_total,
             }));
         });
+        cancelled = cancel_requested();
+        if cancelled {
+            break;
+        }
     }
 
-    Ok((freed, failed))
+    Ok(CleanOutcome { freed, failed, cancelled })
 }

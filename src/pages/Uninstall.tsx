@@ -3,7 +3,7 @@ import {
   Search, Package, PackageOpen, Store, Loader2, Check,
   ScanSearch, Trash2, AlertTriangle, AppWindow, X, ArrowUpDown, ListChecks,
 } from 'lucide-react'
-import type { InstalledApp, ResidualItem, AppType } from '../types'
+import type { InstalledApp, ResidualItem, AppType, CleanReport } from '../types'
 import { getWin32Apps, getStoreApps, peekInstalledApps, uninstallApp, cancelUninstall, checkInstalled, forceRemoveApp, scanResidualsFor, cleanResiduals, getAppIcon, invalidateApps, getInstalledApps } from '../services/api'
 import type { UninstallOutcome } from '../services/api'
 import { PageLoading } from '../components/Loading'
@@ -28,6 +28,7 @@ const RESIDUAL_LABEL: Record<ResidualItem['type'], string> = {
   firewall: '防火墙规则',
   pathenv: 'PATH 变量',
   class: 'COM/文件关联',
+  uninstallkey: '卸载登记',
 }
 
 const FILTERS: [Filter, string][] = [
@@ -53,6 +54,10 @@ export function Uninstall() {
   const [outcomeMsg, setOutcomeMsg] = useState('')
   const [stillInstalled, setStillInstalled] = useState(false)
   const [cleaning, setCleaning] = useState(false)
+  /** 残留清理进度（在弹窗内显示，不另开窗口） */
+  const [residProgress, setResidProgress] = useState<{ done: number; total: number; current: string } | null>(null)
+  /** 残留清理的逐项结果：哪一项成功、哪一项要重启、哪一项为什么没删掉 */
+  const [residReport, setResidReport] = useState<CleanReport | null>(null)
   // 批量卸载队列（BCU 式：多选 → 顺序执行）
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [batch, setBatch] = useState<InstalledApp[]>([])
@@ -155,6 +160,7 @@ export function Uninstall() {
   const uninstallNow = async (app: InstalledApp) => {
     setResidualApp(app)
     setResiduals([])
+    setResidReport(null)
     setOutcomeMsg('')
     setStillInstalled(false)
     setWaitSecs(0)
@@ -227,6 +233,7 @@ export function Uninstall() {
     setPhase('idle')
     setResidualApp(null)
     setResiduals([])
+    setResidReport(null)
   }
 
   /** 批量卸载：按顺序逐个执行，支持跳过剩余并结束 */
@@ -305,32 +312,45 @@ export function Uninstall() {
   }
 
   const cleanResidualsNow = async () => {
+    if (!residualApp) return
     setCleaning(true)
     setStatusMsg('正在清理残留…')
+    setResidReport(null)
+    setResidProgress({ done: 0, total: residSel.length, current: '正在准备…' })
     try {
-      const [freed, failedCount] = await Promise.race([
-        cleanResiduals(residuals),
-        new Promise<[number, number]>((resolve) => setTimeout(() => resolve([0, -1]), 90_000)),
-      ])
-      if (failedCount === -1) {
-        alert('清理超时（部分文件可能被占用），可重新扫描确认。')
-      } else if (failedCount > 0) {
-        alert(`残留清理完成，释放 ${fmtBytes(freed, 2)}；${failedCount} 项因占用或权限不足被跳过。`)
-      } else {
-        alert(`残留已清理完成，释放 ${fmtBytes(freed, 2)}。`)
-      }
+      const r = await cleanResiduals(residuals, (p) =>
+        setResidProgress({ done: p.done, total: p.total, current: p.current }),
+      )
+      setResidReport(r)
+      // 清完立刻重扫：留下的就是"没删掉的那些"，比只报一个数字有用得多
+      const items = await scanResidualsFor(residualApp)
+      setResiduals(items)
+      getInstalledApps(true).then(setApps).catch(() => {})
     } catch (e) {
-      alert(`残留清理失败：${e}`)
+      setResidReport({
+        freed: 0,
+        ok: 0,
+        failed: residSel.length,
+        pendingReboot: 0,
+        items: [{ path: '', ok: false, freed: 0, pendingReboot: false, reason: String(e) }],
+      })
     } finally {
       setCleaning(false)
-      setPhase('idle')
-      setResiduals([])
-      setResidualApp(null)
+      setResidProgress(null)
       setStatusMsg('')
-      setOutcomeMsg('')
-      setStillInstalled(false)
-      getInstalledApps(true).then(setApps).catch(() => {})
     }
+  }
+
+  /** 关闭残留弹窗并复位 */
+  const finishResiduals = () => {
+    setPhase('idle')
+    setResiduals([])
+    setResidualApp(null)
+    setStatusMsg('')
+    setOutcomeMsg('')
+    setStillInstalled(false)
+    setResidReport(null)
+    invalidateApps()
   }
 
   return (
@@ -396,7 +416,21 @@ export function Uninstall() {
               </button>
               <div className="app-icon">
                 {icons[a.id] ?? a.iconData
-                  ? <img src={icons[a.id] ?? a.iconData} alt="" />
+                  ? (
+                    <img
+                      src={icons[a.id] ?? a.iconData}
+                      alt=""
+                      /* 万一 data URL 解不出来：把这一项从缓存里摘掉，回落成通用图标，
+                         避免界面上出现一个破图占位 */
+                      onError={() =>
+                        setIcons((m) => {
+                          const n = { ...m }
+                          delete n[a.id]
+                          return n
+                        })
+                      }
+                    />
+                  )
                   : (a.type === 'store' ? <Store size={22} /> : <Package size={22} />)}
               </div>
               <div className="app-main">
@@ -501,6 +535,51 @@ export function Uninstall() {
               </div>
             )}
 
+            {/* 残留清理进度：直接在弹窗内，和进度条同一个视区 */}
+            {cleaning && residProgress && (
+              <div className="confirm-progress" style={{ marginBottom: 10 }}>
+                <div className="progress-track" style={{ height: 6, flex: 'unset', width: '100%' }}>
+                  <div
+                    className="progress-fill"
+                    style={{
+                      width: `${residProgress.total > 0 ? Math.min(99, Math.round((residProgress.done / residProgress.total) * 100)) : 0}%`,
+                    }}
+                  />
+                </div>
+                <div className="confirm-progress-meta">
+                  <span className="mono" style={{ flexShrink: 0 }}>
+                    {residProgress.done}/{residProgress.total} 项
+                  </span>
+                  <span className="confirm-progress-current" title={residProgress.current}>
+                    {residProgress.current}
+                  </span>
+                </div>
+              </div>
+            )}
+
+            {/* 清理结果：成功 / 需重启 / 失败原因，一项一项说清楚 */}
+            {!cleaning && residReport && (
+              <div
+                style={{
+                  marginBottom: 10, padding: '9px 11px', borderRadius: 8, fontSize: 12, lineHeight: 1.65,
+                  background: residReport.failed > 0 ? 'rgba(217,119,6,.10)' : 'rgba(22,163,74,.10)',
+                  border: `1px solid ${residReport.failed > 0 ? 'rgba(217,119,6,.35)' : 'rgba(22,163,74,.30)'}`,
+                }}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontWeight: 600, color: residReport.failed > 0 ? 'var(--warn)' : 'var(--success)' }}>
+                  {residReport.failed > 0 ? <AlertTriangle size={14} /> : <Check size={14} />}
+                  已清理 {residReport.ok} 项 · 释放 {fmtBytes(residReport.freed, 2)}
+                  {residReport.failed > 0 && ` · ${residReport.failed} 项未删除`}
+                  {residReport.pendingReboot > 0 && `（其中 ${residReport.pendingReboot} 项需重启后生效）`}
+                </div>
+                {residReport.items.filter((i) => !i.ok && i.reason).slice(0, 4).map((i, n) => (
+                  <div key={`${i.path}-${n}`} style={{ color: 'var(--muted)', marginTop: 4, wordBreak: 'break-all' }}>
+                    {i.reason}{i.path ? `：${i.path}` : ''}
+                  </div>
+                ))}
+              </div>
+            )}
+
             {phase === 'waiting' ? (
               <div style={{ padding: '6px 0 2px' }}>
                 <div style={{ fontSize: 12.5, lineHeight: 1.75, color: 'var(--muted)', marginBottom: 10 }}>
@@ -552,6 +631,11 @@ export function Uninstall() {
                       onClick={() => setResiduals((s) => s.map((x) => (x.id === r.id && x.path === r.path ? { ...x, selected: !x.selected } : x)))}>
                       <span className={`checkbox${r.selected ? ' on' : ''}`}><Check size={12} /></span>
                       <span className="r-type">{RESIDUAL_LABEL[r.type] ?? r.type}</span>
+                      {(r.confidence ?? 100) < 60 && (
+                        <span className="tag tag-warn" style={{ flexShrink: 0 }} title="名称相似度较低，默认不勾选；确认后自行勾选">
+                          疑似
+                        </span>
+                      )}
                       <span className="r-path">
                         {r.path}
                         {r.detail && <span style={{ color: 'var(--meta)', marginLeft: 8 }}>· {r.detail}</span>}
@@ -575,10 +659,16 @@ export function Uninstall() {
                     </button>
                   )}
                   <span style={{ flex: 1 }} />
-                  <button className="btn btn-ghost" onClick={() => { setPhase('idle'); setResidualApp(null); setResiduals([]) }}>忽略</button>
-                  <button className="btn btn-danger" disabled={residSel.length === 0 || cleaning} onClick={cleanResidualsNow}>
-                    {cleaning ? <><Loader2 size={13} className="spin" /> 处理中…</> : <><Trash2 size={13} /> 清理选中残留（{residSel.length}）</>}
-                  </button>
+                  {residReport ? (
+                    <button className="btn btn-primary" onClick={finishResiduals}>完成</button>
+                  ) : (
+                    <>
+                      <button className="btn btn-ghost" onClick={finishResiduals} disabled={cleaning}>忽略</button>
+                      <button className="btn btn-danger" disabled={residSel.length === 0 || cleaning} onClick={cleanResidualsNow}>
+                        {cleaning ? <><Loader2 size={13} className="spin" /> 处理中…</> : <><Trash2 size={13} /> 清理选中残留（{residSel.length}）</>}
+                      </button>
+                    </>
+                  )}
                 </div>
               </>
             )}

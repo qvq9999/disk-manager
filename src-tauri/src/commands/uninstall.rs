@@ -8,10 +8,12 @@ use walkdir::WalkDir;
 use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE};
 use winreg::{HKEY, RegKey};
 
+use super::{fsx, residual};
+
 use base64::Engine as _;
 use windows_sys::Win32::Graphics::Gdi::{
     DeleteObject, GetDC, GetDIBits, GetObjectW, ReleaseDC, BITMAP, BITMAPINFO,
-    BITMAPINFOHEADER, DIB_RGB_COLORS,
+    BITMAPINFOHEADER, DIB_RGB_COLORS, HBITMAP,
 };
 use windows_sys::Win32::UI::Shell::SHDefExtractIconW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, HICON, ICONINFO};
@@ -34,19 +36,8 @@ pub struct InstalledApp {
     pub icon_data: Option<String>,
 }
 
-#[derive(Serialize, serde::Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct ResidualItem {
-    pub id: String,
-    pub path: String,
-    #[serde(rename = "type")]
-    pub kind: String, // registry | folder | shortcut | startup | service
-    pub size: u64,
-    pub selected: bool,
-    /// 残留内容明细（如「12 个文件 · 34.5 MB」「含 3 个子键」「指向 …」）
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
-}
+// 残留扫描与清理已迁至 `commands::residual`（v1.3.6）：那里有卸载前的线索快照、
+// 两层目录/注册表枚举与评分匹配。这里只保留「卸载」本身需要的注册表与进程逻辑。
 
 /// 目录快速统计（已不再用于列表体积，保留供扩展）
 #[allow(dead_code)]
@@ -63,7 +54,7 @@ fn dir_size_fast(p: &PathBuf, max_depth: usize) -> u64 {
 }
 
 /// 目录快速统计：(体积, 文件数)
-fn dir_stats(p: &PathBuf, max_depth: usize) -> (u64, u64) {
+pub(crate) fn dir_stats(p: &PathBuf, max_depth: usize) -> (u64, u64) {
     let mut size = 0u64;
     let mut count = 0u64;
     for e in WalkDir::new(p).max_depth(max_depth).follow_links(false).into_iter().filter_map(|e| e.ok()) {
@@ -101,7 +92,7 @@ fn sanitize_str(s: &str) -> String {
         .to_string()
 }
 
-fn reg_str(sub: &RegKey, value: &str) -> String {
+pub(crate) fn reg_str(sub: &RegKey, value: &str) -> String {
     let direct = sub.get_value::<String, _>(value).unwrap_or_default();
     // 含替换符 → 说明原始字节不是合法 UTF-16，尝试按 GB18030 重新解码
     if direct.contains('\u{FFFD}') {
@@ -117,7 +108,7 @@ fn reg_str(sub: &RegKey, value: &str) -> String {
 }
 
 /// 系统/公共厂商键名白名单：避免把 Microsoft、驱动厂商等误报为软件残留
-fn is_whitelisted(name: &str) -> bool {
+pub(crate) fn is_whitelisted(name: &str) -> bool {
     const WL: &[&str] = &[
         "microsoft", "windows", "intel", "nvidia", "amd", "realtek", "mediatek", "qualcomm",
         "google", "mozilla", "apple", "oracle", "java", "vmware", "citrix", "adobe systems",
@@ -176,13 +167,15 @@ pub fn restart_as_admin() -> Result<String, String> {
 /// Geek 式**强制卸载**：用于自带卸载器损坏的软件（例如报"卸载入口会话参数无效"）。
 /// 做法：删除注册表记录的安装目录 → 删除卸载注册表键 → 清理由名称/线索匹配到的所有残留。
 #[tauri::command]
-pub async fn force_remove_app(id: String) -> Result<UninstallResult, String> {
-    tauri::async_runtime::spawn_blocking(move || force_remove_app_impl(id))
+pub async fn force_remove_app(app: tauri::AppHandle, id: String) -> Result<UninstallResult, String> {
+    use tauri::Manager;
+    let dir = app.path().app_config_dir().ok();
+    tauri::async_runtime::spawn_blocking(move || force_remove_app_impl(id, dir))
         .await
         .map_err(|e| format!("强制卸载任务失败: {e}"))?
 }
 
-fn force_remove_app_impl(id: String) -> Result<UninstallResult, String> {
+fn force_remove_app_impl(id: String, cfg_dir: Option<PathBuf>) -> Result<UninstallResult, String> {
     let key_name = id.strip_prefix("win32:").ok_or("仅支持 Win32 软件的强制卸载")?;
     let _guard = APPS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut freed = 0u64;
@@ -205,38 +198,40 @@ fn force_remove_app_impl(id: String) -> Result<UninstallResult, String> {
             let icon: String = reg_str(&sub, "DisplayIcon");
             let un: String = reg_str(&sub, "UninstallString");
 
+            // 强制卸载的第一件事：先把线索存下来（键马上就要被删掉了）
+            residual::snapshot_before_uninstall(
+                cfg_dir.as_deref(),
+                residual::clue_from_key(&sub, &id, key_name),
+            );
+
             // ① 删除安装目录（InstallLocation / DisplayIcon / UninstallString 所在目录）
+            // 走 fsx：清只读属性 → 权限修复重试 → 占用则登记重启后删除，逐项给原因
             for cand in [loc.as_str(), icon.as_str(), un.as_str()].into_iter().filter(|s| !s.is_empty()) {
-                if let Some(dir) = derive_dir(cand) {
-                    if dir.is_dir() && dir.to_string_lossy().len() > 6 {
-                        let (sz, _) = dir_stats(&dir, 6);
-                        match std::fs::remove_dir_all(&dir) {
-                            Ok(()) => {
-                                freed += sz;
-                                removed_dirs += 1;
-                            }
-                            Err(_) => failed += 1,
+                if let Some(d) = derive_dir(cand) {
+                    if d.is_dir() && d.to_string_lossy().len() > 6 {
+                        let r = fsx::remove_dir(&d);
+                        freed += r.freed;
+                        if r.ok {
+                            removed_dirs += 1;
+                        } else {
+                            failed += 1;
                         }
                     }
                 }
             }
 
-            // ② 删除卸载注册表键
-            let target = format!("{}\\{}", full_path, key_name);
-            let _ = reg_delete_tree(hive, &target);
+            // ② 删除卸载注册表键（递归，含多层子键）
+            let hive_tag = if hive == HKEY_CURRENT_USER { "HKCU" } else { "HKLM" };
+            let _ = residual::delete_reg_path(hive_tag, &format!("{}\\{}", full_path, key_name));
         }
     }
 
     // ③ 清理其余残留（快捷方式 / 启动项 / 同名目录 / Software 键）
     if !name.is_empty() {
-        let items = scan_app_residuals_impl(name.clone());
-        match clean_residuals_impl(items) {
-            Ok((f2, fail2)) => {
-                freed += f2;
-                failed += fail2;
-            }
-            Err(_) => failed += 1,
-        }
+        let items = residual::scan_for(&name, Some(&id), cfg_dir.as_deref());
+        let report = residual::clean_items(&items);
+        freed += report.freed;
+        failed += report.failed;
     }
 
     let still = is_still_installed(&name);
@@ -516,12 +511,21 @@ pub fn cancel_uninstall() {
 }
 
 /// 启动卸载（Win32 走原卸载器；Store 走 Remove-AppxPackage）——后台线程执行防卡界面
+///
+/// ⚠️ 卸载**之前**必须先把注册表线索快照下来：卸载器删掉 `Uninstall\<key>` 之后，
+/// 安装目录 / 发布者 / 卸载命令行就再也找不回来了，残留扫描会退化成"只按名字猜"。
 #[tauri::command]
-pub async fn uninstall_app(id: String, silent_first: Option<bool>) -> Result<UninstallResult, String> {
+pub async fn uninstall_app(
+    app: tauri::AppHandle,
+    id: String,
+    silent_first: Option<bool>,
+) -> Result<UninstallResult, String> {
+    use tauri::Manager;
+    let cfg_dir = app.path().app_config_dir().ok();
     // 默认「交互式优先」：用户点卸载就是想看到那个卸载向导，
     // 静默只作为交互式不可用时的兜底；批量卸载则由前端显式要求静默优先。
     let silent_first = silent_first.unwrap_or(false);
-    tauri::async_runtime::spawn_blocking(move || uninstall_app_impl(id, silent_first))
+    tauri::async_runtime::spawn_blocking(move || uninstall_app_impl(id, silent_first, cfg_dir))
         .await
         .map_err(|e| format!("卸载任务失败: {e}"))?
 }
@@ -713,7 +717,7 @@ fn kill_processes_under(install_dir: &str) -> u32 {
     text.lines().filter(|l| !l.trim().is_empty()).count() as u32
 }
 
-fn uninstall_app_impl(id: String, silent_first: bool) -> Result<UninstallResult, String> {
+fn uninstall_app_impl(id: String, silent_first: bool, cfg_dir: Option<PathBuf>) -> Result<UninstallResult, String> {
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
 
@@ -752,6 +756,12 @@ fn uninstall_app_impl(id: String, silent_first: bool) -> Result<UninstallResult,
             let icon: String = reg_str(&sub, "DisplayIcon");
             let loc: String = reg_str(&sub, "InstallLocation");
             let name: String = reg_str(&sub, "DisplayName");
+
+            // 关键顺序：先把线索写盘，再启动卸载器。卸载器一跑，这个键就没了。
+            residual::snapshot_before_uninstall(
+                cfg_dir.as_deref(),
+                residual::clue_from_key(&sub, &id, key_name),
+            );
 
             // 候选命令（按可靠性排序）：自带卸载器 → 静默串 → 常规串
             // MSI 的 UninstallString 常写成 `/I{GUID}`（修改安装）而非 `/X{GUID}`，先统一修正
@@ -1288,634 +1298,7 @@ fn launch_via_shellexecute(cmd_line: &str) -> LaunchOutcome {
     }
 }
 
-/// 递归删除注册表键（winreg 无 delete_tree，自行实现）
-fn reg_delete_tree(hive: HKEY, path: &str) -> Result<(), String> {
-    let (parent_path, target) = path.rsplit_once('\\').ok_or("路径无效")?;
-    let parent = RegKey::predef(hive)
-        .open_subkey_with_flags(parent_path, KEY_READ | KEY_WRITE)
-        .map_err(|e| e.to_string())?;
-    if let Ok(sub) = parent.open_subkey_with_flags(target, KEY_READ) {
-        for k in sub.enum_keys().flatten() {
-            let _ = sub.delete_subkey(&k); // 先删一层子键（残留在常规软件键下通常只有 1-2 层）
-        }
-    }
-    parent.delete_subkey(target).map_err(|e| e.to_string())
-}
-
-/// Geek 式残留扫描：注册表 + 文件目录
-#[tauri::command]
-pub async fn scan_app_residuals(app_name: String) -> Vec<ResidualItem> {
-    tauri::async_runtime::spawn_blocking(move || {
-        // 残留扫描含目录遍历，走串行锁避免与软件枚举互相拖慢
-        let _guard = APPS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scan_app_residuals_impl(app_name)))
-            .unwrap_or_default()
-    })
-    .await
-    .unwrap_or_default()
-}
-
-/// 从注册表该软件的条目中提取线索：安装目录路径 + 目录名关键词
-/// （Geek/Revo 的关键做法：软件目录名往往与显示名不同，如「网易云音乐」目录是 CloudMusic）
-fn app_clues(app_name: &str) -> (Vec<String>, Vec<PathBuf>) {
-    let mut keys: Vec<String> = Vec::new();
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    for hive in [HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER] {
-        for path in WIN32_UNINSTALL_PATHS {
-            let full_path = if hive == HKEY_CURRENT_USER {
-                format!("Software\\{}", path.trim_start_matches("SOFTWARE\\"))
-            } else {
-                path.to_string()
-            };
-            let Ok(root) = RegKey::predef(hive).open_subkey_with_flags(&full_path, KEY_READ) else { continue };
-            for key in root.enum_keys().flatten() {
-                let Ok(sub) = root.open_subkey(&key) else { continue };
-                let n: String = reg_str(&sub, "DisplayName");
-                if n.is_empty() || !(n.eq_ignore_ascii_case(app_name) || n.contains(app_name) || app_name.contains(&n)) {
-                    continue;
-                }
-                let loc: String = reg_str(&sub, "InstallLocation");
-                let un: String = reg_str(&sub, "UninstallString");
-                let icon: String = reg_str(&sub, "DisplayIcon");
-                let pubr: String = reg_str(&sub, "Publisher");
-                for raw in [loc.clone(), un, icon, pubr] {
-                    if raw.trim().is_empty() {
-                        continue;
-                    }
-                    let cleaned = raw.trim().trim_matches('"');
-                    let first = cleaned.split(',').next().unwrap_or("").trim().trim_matches('"');
-                    let p = PathBuf::from(first.split_whitespace().next().unwrap_or(first));
-                    let dir = if p.is_file() { p.parent().map(|x| x.to_path_buf()) } else { Some(p.clone()) };
-                    if let Some(d) = dir {
-                        if let Some(name) = d.file_name() {
-                            let s = name.to_string_lossy().to_lowercase();
-                            if s.len() >= 3 { keys.push(s); }
-                        }
-                        // 上一级目录名（如 ...\Netease\CloudMusic → netease）
-                        if let Some(par) = d.parent().and_then(|x| x.file_name()) {
-                            let s = par.to_string_lossy().to_lowercase();
-                            if s.len() >= 3 && s != "program files" && s != "program files (x86)" && s != "appdata" && s != "local" && s != "roaming" {
-                                keys.push(s);
-                            }
-                        }
-                        if d.is_dir() && !dirs.contains(&d) {
-                            dirs.push(d);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    keys.sort();
-    keys.dedup();
-    (keys, dirs)
-}
-
-/// 扫描计划任务（Geek/HiBit 必扫项：很多软件卸载后计划任务仍在，会自己把自己拉起来）
-fn scan_scheduled_tasks(needles: &[String]) -> Vec<String> {
-    let script = format!(
-        "{} Get-ScheduledTask -ErrorAction SilentlyContinue | ForEach-Object {{ \"$($_.TaskPath)$($_.TaskName)\" }}",
-        crate::commands::PS_UTF8_PRELUDE
-    );
-    let Ok(out) = crate::commands::silent_command("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .output()
-    else {
-        return Vec::new();
-    };
-    let text = crate::commands::decode_out(&out.stdout);
-    text.lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty() && l.as_str() != "\\")
-        .filter(|l| {
-            let low = l.to_lowercase();
-            needles.iter().any(|k| low.contains(k.as_str()))
-        })
-        .take(40)
-        .collect()
-}
-
-/// 扫描防火墙规则（软件常留下入站 / 出站规则）
-fn scan_firewall_rules(needles: &[String]) -> Vec<String> {
-    let script = format!(
-        "{} Get-NetFirewallRule -ErrorAction SilentlyContinue | ForEach-Object {{ $_.DisplayName }}",
-        crate::commands::PS_UTF8_PRELUDE
-    );
-    let Ok(out) = crate::commands::silent_command("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .output()
-    else {
-        return Vec::new();
-    };
-    let text = crate::commands::decode_out(&out.stdout);
-    text.lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
-        .filter(|l| {
-            let low = l.to_lowercase();
-            needles.iter().any(|k| low.contains(k.as_str()))
-        })
-        .map(|l| l.to_string())
-        .take(40)
-        .collect()
-}
-
-/// 扫描 PATH 环境变量中指向该软件的目录段（Geek/HiBit 会摘掉这类残留段）
-fn scan_path_env_entries(needles: &[String]) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = Vec::new();
-    for (hive, path, tag) in [
-        (HKEY_CURRENT_USER, r"Environment", "HKCU"),
-        (HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment", "HKLM"),
-    ] {
-        let Ok(k) = RegKey::predef(hive).open_subkey_with_flags(path, KEY_READ) else { continue };
-        let Ok(v) = k.get_value::<String, _>("Path") else { continue };
-        for seg in v.split(';') {
-            let s = seg.trim();
-            if s.is_empty() {
-                continue;
-            }
-            let low = s.to_lowercase();
-            if needles.iter().any(|n| low.contains(n.as_str())) {
-                let s = s.to_string();
-                if !out.iter().any(|(_, e)| *e == s) {
-                    out.push((tag.to_string(), s));
-                }
-            }
-        }
-    }
-    out
-}
-
-/// 卸载残留扫描入口
-fn scan_app_residuals_impl(app_name: String) -> Vec<ResidualItem> {
-    let mut out: Vec<ResidualItem> = Vec::new();
-    let mut n = 0;
-
-    // ---- 关键词：显示名 + 首词 + 中文前 4 字 + 注册表线索（安装目录名等）----
-    let full = app_name.to_lowercase();
-    let mut needles: Vec<String> = vec![full.clone()];
-    let first = app_name.split([' ', '-', '_']).next().unwrap_or(&app_name).to_lowercase();
-    if first.len() >= 3 && first != full {
-        needles.push(first);
-    }
-    if !app_name.is_ascii() && app_name.chars().count() > 4 {
-        needles.push(app_name.chars().take(4).collect::<String>().to_lowercase());
-    }
-    let (extra_keys, install_dirs) = app_clues(&app_name);
-    needles.extend(extra_keys);
-    needles.sort();
-    needles.dedup();
-    let needles: Vec<String> = needles.into_iter().filter(|k| !k.is_empty() && !is_whitelisted(k)).collect();
-
-    let hit = |s: &str| {
-        let l = s.to_lowercase();
-        needles.iter().any(|k| l.contains(k.as_str()))
-    };
-
-    // ---- ① 注册表线索中的安装目录：仍存在则直接列为高置信度残留 ----
-    for d in &install_dirs {
-        if d.is_dir() {
-            let (size, files) = dir_stats(d, 4);
-            n += 1;
-            out.push(ResidualItem {
-                id: format!("r{n}"),
-                path: d.to_string_lossy().to_string(),
-                kind: "folder".into(),
-                size,
-                selected: true,
-                detail: Some(format!("原安装目录（注册表记录） · {files} 个文件")),
-            });
-        }
-    }
-
-    // ---- ② 注册表：HKCU\Software 与 HKLM\SOFTWARE 下的同名子键 ----
-    for (hive, root_path, tag) in [
-        (HKEY_CURRENT_USER, "Software", "HKCU"),
-        (HKEY_LOCAL_MACHINE, "SOFTWARE", "HKLM"),
-    ] {
-        if let Ok(root) = RegKey::predef(hive).open_subkey_with_flags(root_path, KEY_READ) {
-            for key in root.enum_keys().flatten() {
-                // 命中关键词且不在系统/驱动厂商白名单内，避免误报
-                if hit(&key) && !is_whitelisted(&key) {
-                    let subs = root
-                        .open_subkey_with_flags(&key, KEY_READ)
-                        .map(|k| k.enum_keys().flatten().count())
-                        .unwrap_or(0);
-                    n += 1;
-                    out.push(ResidualItem {
-                        id: format!("r{n}"),
-                        path: format!("{tag}\\{root_path}\\{key}"),
-                        kind: "registry".into(),
-                        size: 0,
-                        selected: true,
-                        detail: Some(if subs > 0 {
-                            format!("软件配置注册表键 · 含 {subs} 个子键")
-                        } else {
-                            "软件配置注册表键".into()
-                        }),
-                    });
-                }
-            }
-        }
-    }
-
-    // ② 开机启动项（HKCU/HKLM Run + Wow6432Node Run）
-    for (hive, path, tag) in [
-        (HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", "HKCU"),
-        (HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", "HKLM"),
-        (HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run", "HKLM(x86)"),
-    ] {
-        if let Ok(run) = RegKey::predef(hive).open_subkey_with_flags(path, KEY_READ) {
-            for (vname, _) in run.enum_values().flatten() {
-                if hit(&vname) {
-                    n += 1;
-                    out.push(ResidualItem {
-                        id: format!("r{n}"),
-                        path: format!("{tag}\\Run\\{vname}"),
-                        kind: "startup".into(),
-                        size: 0,
-                        selected: true,
-                        detail: Some(format!("开机自启动项：{vname}")),
-                    });
-                }
-            }
-        }
-    }
-
-    // ③ 服务（HKLM\SYSTEM\CurrentControlSet\Services 下名称含关键词，跳过微软自带）
-    if let Ok(svc) = RegKey::predef(HKEY_LOCAL_MACHINE)
-        .open_subkey_with_flags(r"SYSTEM\CurrentControlSet\Services", KEY_READ)
-    {
-        for key in svc.enum_keys().flatten() {
-            if hit(&key) && !is_whitelisted(&key) {
-                n += 1;
-                out.push(ResidualItem {
-                    id: format!("r{n}"),
-                    path: format!("HKLM\\SYSTEM\\CurrentControlSet\\Services\\{key}"),
-                    kind: "service".into(),
-                    size: 0,
-                    selected: false, // 服务残留默认不勾选（需管理员且需人工确认）
-                    detail: Some("后台服务键（清理需管理员权限）".into()),
-                });
-            }
-        }
-    }
-
-    // ④ 快捷方式（开始菜单 / 公共桌面 / 当前用户桌面）
-    let mut lnk_dirs: Vec<PathBuf> = Vec::new();
-    if let Ok(a) = std::env::var("APPDATA") {
-        lnk_dirs.push(PathBuf::from(&a).join(r"Microsoft\Windows\Start Menu\Programs"));
-    }
-    if let Ok(p) = std::env::var("PUBLIC") {
-        lnk_dirs.push(PathBuf::from(&p).join("Desktop"));
-        lnk_dirs.push(PathBuf::from(&p).join(r"Microsoft\Windows\Start Menu\Programs"));
-    }
-    if let Ok(u) = std::env::var("USERPROFILE") {
-        lnk_dirs.push(PathBuf::from(&u).join("Desktop"));
-    }
-    for dir in lnk_dirs {
-        if let Ok(rd) = std::fs::read_dir(&dir) {
-            for e in rd.flatten() {
-                let fname = e.file_name().to_string_lossy().to_string();
-                if fname.to_lowercase().ends_with(".lnk") && hit(fname.trim_end_matches(".lnk")) {
-                    n += 1;
-                    out.push(ResidualItem {
-                        id: format!("r{n}"),
-                        path: e.path().to_string_lossy().to_string(),
-                        kind: "shortcut".into(),
-                        size: 0,
-                        selected: true,
-                        detail: Some("快捷方式（开始菜单 / 桌面）".into()),
-                    });
-                }
-            }
-        }
-    }
-
-    // ⑤ 计划任务（Geek/HiBit 必扫：卸载后计划任务常在，会自己把自己重新拉起来）
-    for task in scan_scheduled_tasks(&needles) {
-        n += 1;
-        out.push(ResidualItem {
-            id: format!("r{n}"),
-            path: format!("计划任务：{task}"),
-            kind: "task".into(),
-            size: 0,
-            selected: true,
-            detail: Some("计划任务（卸载后仍可能自动拉起该软件）".into()),
-        });
-    }
-
-    // ⑥ 防火墙规则（软件常留下入站 / 出站规则）
-    for fr in scan_firewall_rules(&needles) {
-        n += 1;
-        out.push(ResidualItem {
-            id: format!("r{n}"),
-            path: format!("防火墙规则：{fr}"),
-            kind: "firewall".into(),
-            size: 0,
-            selected: true,
-            detail: Some("Windows Defender 防火墙规则".into()),
-        });
-    }
-
-    // ⑦ PATH 环境变量中的目录段（卸载后忘了摘的路径）
-    for (tag, seg) in scan_path_env_entries(&needles) {
-        n += 1;
-        out.push(ResidualItem {
-            id: format!("r{n}"),
-            path: format!("{tag}\\Environment\\Path 片段：{seg}"),
-            kind: "pathenv".into(),
-            size: 0,
-            selected: true,
-            detail: Some("PATH 环境变量残留目录段（应从 Path 中移除）".into()),
-        });
-    }
-
-    // ⑧ 启动文件夹（Geek 会扫 Startup 与中文「启动」目录）
-    let mut su_dirs: Vec<PathBuf> = Vec::new();
-    for var in ["APPDATA", "PROGRAMDATA"] {
-        if let Ok(v) = std::env::var(var) {
-            let base = PathBuf::from(v);
-            su_dirs.push(base.join(r"Microsoft\Windows\Start Menu\Programs\Startup"));
-            su_dirs.push(base.join(r"Microsoft\Windows\Start Menu\Programs\启动"));
-        }
-    }
-    for dir in su_dirs {
-        if let Ok(rd) = std::fs::read_dir(&dir) {
-            for e in rd.flatten() {
-                let fname = e.file_name().to_string_lossy().to_string();
-                if !fname.is_empty() && hit(&fname) {
-                    let sz = e.metadata().map(|m| m.len()).unwrap_or(0);
-                    n += 1;
-                    out.push(ResidualItem {
-                        id: format!("r{n}"),
-                        path: e.path().to_string_lossy().to_string(),
-                        kind: "startupfile".into(),
-                        size: sz,
-                        selected: true,
-                        detail: Some("开机启动文件夹内的残留项".into()),
-                    });
-                }
-            }
-        }
-    }
-
-    // ⑨ COM / 文件关联类注册表键（HKLM 与 WOW6432Node 的 Classes\<key>）
-    for (root_path, tag) in [("SOFTWARE\\Classes", "HKLM"), ("SOFTWARE\\WOW6432Node\\Classes", "HKLM(x86)")] {
-        if let Ok(root) = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(root_path, KEY_READ) {
-            for key in root.enum_keys().flatten() {
-                // 只取顶层且像 ProgID 的键（xxx.yyy / xxx.yyy.1），避开海量 CLSID
-                let dots = key.matches('.').count();
-                let looks_progid = (1..=3).contains(&dots)
-                    && key.chars().next().map(|c| c.is_ascii_alphabetic()).unwrap_or(false)
-                    && !key.starts_with("CLSID")
-                    && !key.starts_with("TypeLib")
-                    && !key.starts_with("Interface")
-                    && !key.starts_with("AppID");
-                if looks_progid && hit(&key) && !is_whitelisted(&key) {
-                    n += 1;
-                    out.push(ResidualItem {
-                        id: format!("r{n}"),
-                        path: format!("{tag}\\{root_path}\\{key}"),
-                        kind: "class".into(),
-                        size: 0,
-                        selected: true,
-                        detail: Some("COM / 文件关联注册表键".into()),
-                    });
-                }
-            }
-        }
-    }
-
-    // 文件目录（Geek 做法：Program Files / AppData 递归两层，一层会漏掉装在子文件夹里的软件）
-    let mut base_dirs: Vec<(String, PathBuf)> = vec![
-        ("C:\\Program Files".into(), PathBuf::from("C:\\Program Files")),
-        ("C:\\Program Files (x86)".into(), PathBuf::from("C:\\Program Files (x86)")),
-    ];
-    if let Ok(appdata) = std::env::var("APPDATA") {
-        base_dirs.push(("%AppData%".into(), PathBuf::from(appdata)));
-    }
-    if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        base_dirs.push(("%LocalAppData%".into(), PathBuf::from(local)));
-    }
-    if let Ok(pd) = std::env::var("ProgramData") {
-        base_dirs.push(("%ProgramData%".into(), PathBuf::from(pd)));
-    }
-    for (tag, base) in base_dirs {
-        if let Ok(rd) = std::fs::read_dir(&base) {
-            for entry in rd.flatten() {
-                let dn = entry.file_name().to_string_lossy().to_string();
-                if hit(&dn) {
-                    let (size, files) = dir_stats(&entry.path(), 3);
-                    n += 1;
-                    out.push(ResidualItem {
-                        id: format!("r{n}"),
-                        path: format!("{tag}\\{dn}"),
-                        kind: "folder".into(),
-                        size,
-                        selected: true,
-                        detail: Some(format!("残留目录 · {files} 个文件")),
-                    });
-                }
-            }
-        }
-    }
-    out
-}
-
-/// 清理选中残留：目录/快捷方式直接删除，注册表键与启动项直接删，服务键需管理员
-/// 返回 (释放字节数, 失败项数)；单项失败跳过并继续，不会卡住整批
-#[tauri::command]
-pub async fn clean_residuals(items: Vec<ResidualItem>) -> Result<(u64, u32), String> {
-    tauri::async_runtime::spawn_blocking(move || clean_residuals_impl(items))
-        .await
-        .map_err(|e| format!("残留清理任务失败: {e}"))?
-}
-
-fn clean_residuals_impl(items: Vec<ResidualItem>) -> Result<(u64, u32), String> {
-    let mut freed = 0u64;
-    let mut failed = 0u32;
-    for it in &items {
-        if !it.selected {
-            continue;
-        }
-        match it.kind.as_str() {
-            "registry" => {
-                let (hive, rest) = if it.path.starts_with("HKCU") {
-                    (HKEY_CURRENT_USER, it.path.trim_start_matches("HKCU\\"))
-                } else {
-                    (HKEY_LOCAL_MACHINE, it.path.trim_start_matches("HKLM\\"))
-                };
-                if reg_delete_tree(hive, rest).is_err() {
-                    failed += 1;
-                }
-            }
-            "startup" => {
-                // path 格式：HKCU\Run\<值名> | HKLM\Run\<值名> | HKLM(x86)\Run\<值名>
-                let hive = if it.path.starts_with("HKCU") { HKEY_CURRENT_USER } else { HKEY_LOCAL_MACHINE };
-                let Some((_, value_name)) = it.path.rsplit_once('\\') else { failed += 1; continue };
-                let open_path = if it.path.starts_with("HKCU") {
-                    r"Software\Microsoft\Windows\CurrentVersion\Run"
-                } else if it.path.contains("(x86)") {
-                    r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run"
-                } else {
-                    r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
-                };
-                let ok = RegKey::predef(hive)
-                    .open_subkey_with_flags(open_path, KEY_READ | KEY_WRITE)
-                    .and_then(|run| run.delete_value(value_name))
-                    .is_ok();
-                if !ok { failed += 1; }
-            }
-            "service" => {
-                if reg_delete_tree(HKEY_LOCAL_MACHINE, it.path.trim_start_matches("HKLM\\")).is_err() {
-                    failed += 1; // 通常是缺少管理员权限
-                }
-            }
-            "shortcut" => {
-                let p = PathBuf::from(&it.path);
-                if p.is_file() {
-                    let sz = p.metadata().map(|m| m.len()).unwrap_or(0);
-                    match std::fs::remove_file(&p) {
-                        Ok(()) => freed += sz,
-                        Err(_) => failed += 1,
-                    }
-                }
-            }
-            "folder" => {
-                match resolve_base_dir(&it.path) {
-                    Some(real) => {
-                        let (size, _) = dir_stats(&real, 4);
-                        // 直接删除（残留清理追求彻底与速度，不占回收站）
-                        match std::fs::remove_dir_all(&real) {
-                            Ok(()) => freed += size,
-                            Err(_) => failed += 1, // 文件被占用或无权限
-                        }
-                    }
-                    None => failed += 1,
-                }
-            }
-            // 计划任务：Unregister-ScheduledTask（卸载后残留的计划任务会自己把软件拉起来）
-            "task" => {
-                let Some((_, raw)) = it.path.split_once("计划任务：") else { failed += 1; continue };
-                let full = raw.trim();
-                let (tpath, tname) = match full.rsplit_once('\\') {
-                    Some((p, n)) => (p, n),
-                    None => ("\\", full),
-                };
-                let script = format!(
-                    "{} Unregister-ScheduledTask -TaskName '{}' -TaskPath '{}' -Confirm:$false -ErrorAction SilentlyContinue",
-                    crate::commands::PS_UTF8_PRELUDE,
-                    tname.replace('\'', "''"),
-                    tpath.replace('\'', "''")
-                );
-                let ok = crate::commands::silent_command("powershell")
-                    .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-                    .output()
-                    .map(|o| o.status.success())
-                    .unwrap_or(false);
-                if !ok { failed += 1 }
-            }
-            // 防火墙规则：Remove-NetFirewallRule
-            "firewall" => {
-                let Some((_, raw)) = it.path.split_once("防火墙规则：") else { failed += 1; continue };
-                let script = format!(
-                    "{} Remove-NetFirewallRule -DisplayName '{}' -ErrorAction SilentlyContinue",
-                    crate::commands::PS_UTF8_PRELUDE,
-                    raw.trim().replace('\'', "''")
-                );
-                let ok = crate::commands::silent_command("powershell")
-                    .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-                    .output()
-                    .map(|o| o.status.success())
-                    .unwrap_or(false);
-                if !ok { failed += 1 }
-            }
-            // PATH 环境变量残留段：从 Path 值里摘掉这一段（保留其余段）
-            "pathenv" => {
-                let Some((_, raw)) = it.path.split_once("Path 片段：") else { failed += 1; continue };
-                let seg = raw.trim().to_string();
-                let (hive, env_path) = if it.path.starts_with("HKCU") {
-                    (HKEY_CURRENT_USER, "Environment")
-                } else {
-                    (HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment")
-                };
-                let ok = match RegKey::predef(hive).open_subkey_with_flags(env_path, KEY_READ | KEY_WRITE) {
-                    Ok(k) => {
-                        let cur: String = k.get_value("Path").unwrap_or_default();
-                        let parts: Vec<&str> = cur.split(';').collect();
-                        let kept: Vec<&str> = parts
-                            .iter()
-                            .copied()
-                            .filter(|s| !s.trim().eq_ignore_ascii_case(&seg))
-                            .collect();
-                        if kept.len() == parts.len() {
-                            false // 没找到该段，无需改写
-                        } else {
-                            k.set_value("Path", &kept.join(";")).is_ok()
-                        }
-                    }
-                    Err(_) => false,
-                };
-                if !ok { failed += 1 }
-            }
-            // COM / 文件关联类注册表键
-            "class" => {
-                let rest = it
-                    .path
-                    .trim_start_matches("HKLM(x86)")
-                    .trim_start_matches("HKLM")
-                    .trim_start_matches("HKCU")
-                    .trim_start_matches('\\')
-                    .replace("SOFTWARE\\WOW6432Node\\", "SOFTWARE\\");
-                if rest.is_empty() || reg_delete_tree(HKEY_LOCAL_MACHINE, &rest).is_err() {
-                    failed += 1
-                }
-            }
-            // 启动文件夹内的残留（文件或子目录）
-            "startupfile" => {
-                let p = PathBuf::from(&it.path);
-                if p.is_file() {
-                    let sz = p.metadata().map(|m| m.len()).unwrap_or(0);
-                    match std::fs::remove_file(&p) {
-                        Ok(()) => freed += sz,
-                        Err(_) => failed += 1,
-                    }
-                } else if p.is_dir() {
-                    let (sz, _) = dir_stats(&p, 2);
-                    match std::fs::remove_dir_all(&p) {
-                        Ok(()) => freed += sz,
-                        Err(_) => failed += 1,
-                    }
-                } else {
-                    failed += 1
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok((freed, failed))
-}
-
-fn resolve_base_dir(shown: &str) -> Option<PathBuf> {
-    let name = shown.rsplit('\\').next()?;
-    for var in ["APPDATA", "LOCALAPPDATA", "ProgramData"] {
-        if shown.starts_with('%') {
-            if let Ok(v) = std::env::var(var) {
-                let candidate = PathBuf::from(&v).join(name);
-                if candidate.is_dir() {
-                    return Some(candidate);
-                }
-            }
-        }
-    }
-    let candidate = PathBuf::from("C:\\Program Files").join(name);
-    if candidate.is_dir() {
-        return Some(candidate);
-    }
-    let candidate = PathBuf::from("C:\\Program Files (x86)").join(name);
-    candidate.is_dir().then_some(candidate)
-}
+// 以上「残留扫描 / 清理 / 路径解析」已整体迁至 commands::residual。
 
 // ---------------- 软件图标提取（DisplayIcon → HICON → PNG dataURL） ----------------
 
@@ -1944,12 +1327,139 @@ fn parse_display_icon(v: &str) -> Option<(String, i32)> {
 }
 
 /// HICON → PNG 字节（32bpp BGRA → RGBA）
+/// 把 1bpp 的 AND mask 位转成 alpha。
+///
+/// Windows 的老图标把"哪里透明"放在 mask 里而不放进 alpha 通道：
+/// 32bpp 颜色位图的 alpha 字节可以全是 0，此时按 alpha 直出就是**整张全透明**
+/// （实测本机 10/61 个软件中招：7-Zip、VC++ 运行库、OpenAL、Windows Desktop Runtime…）。
+///
+/// 规则：mask 位 = 1 表示透明，= 0 表示不透明。
+/// `stride` 是 DIB 行字节数（4 字节对齐，48px 宽时是 8 而不是 6，这里最容易算错）。
+/// 返回被标记为透明的像素数；0 表示这张 mask 没有提供任何形状信息。
+fn mask_bits_to_alpha(mask: &[u8], stride: usize, w: usize, h: usize, rgba: &mut [u8]) -> usize {
+    let mut transparent = 0usize;
+    for y in 0..h {
+        let row = y * stride;
+        if row + stride > mask.len() {
+            // mask 数据不足：剩余行一律按不透明处理，避免出现一片"透明洞"
+            for yy in y..h {
+                for x in 0..w {
+                    let idx = (yy * w + x) * 4 + 3;
+                    if idx < rgba.len() {
+                        rgba[idx] = 255;
+                    }
+                }
+            }
+            break;
+        }
+        for x in 0..w {
+            let idx = (y * w + x) * 4 + 3;
+            if idx >= rgba.len() {
+                continue;
+            }
+            let bit = (mask[row + x / 8] >> (7 - (x % 8))) & 1;
+            if bit == 1 {
+                rgba[idx] = 0;
+                transparent += 1;
+            } else {
+                rgba[idx] = 255;
+            }
+        }
+    }
+    transparent
+}
+
+/// 从 HBITMAP（AND mask）读出位并合成 alpha。失败返回 false。
+unsafe fn apply_mask_alpha(mask: HBITMAP, w: i32, h: i32, rgba: &mut [u8]) -> bool {
+    unsafe {
+        if mask.is_null() || w <= 0 || h <= 0 {
+            return false;
+        }
+        let mut mbm: BITMAP = std::mem::zeroed();
+        if GetObjectW(
+            mask as _,
+            std::mem::size_of::<BITMAP>() as i32,
+            &mut mbm as *mut _ as *mut core::ffi::c_void,
+        ) == 0
+        {
+            return false;
+        }
+        let mw = mbm.bmWidth.max(1);
+        // mask 的高度是颜色位图的两倍（上半 AND、下半 XOR），只需要上半
+        let mh = mbm.bmHeight.abs().max(1);
+        let stride = (((mw as usize) + 31) / 32) * 4;
+        let mut buf = vec![0u8; stride * mh as usize];
+        let mut bmi: BITMAPINFO = std::mem::zeroed();
+        bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+        bmi.bmiHeader.biWidth = mw;
+        bmi.bmiHeader.biHeight = -mh; // top-down
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 1;
+        bmi.bmiHeader.biCompression = 0; // BI_RGB
+        let hdc = GetDC(std::ptr::null_mut());
+        let got = GetDIBits(
+            hdc,
+            mask,
+            0,
+            mh as u32,
+            buf.as_mut_ptr() as *mut core::ffi::c_void,
+            &mut bmi,
+            DIB_RGB_COLORS,
+        );
+        ReleaseDC(std::ptr::null_mut(), hdc);
+        if got == 0 {
+            return false;
+        }
+        let cw = (w as usize).min(mw as usize);
+        let ch = (h as usize).min(mh as usize);
+        mask_bits_to_alpha(&buf, stride, cw, ch, rgba) > 0
+    }
+}
+
+/// HICON → PNG 字节。
+///
+/// 关键分支（v1.3.6）：
+///   ① 颜色位图存在但 alpha 全 0 → 用 AND mask 反相合成 alpha（否则整张全透明）；
+///   ② mask 也没有形状信息 → alpha 全设 255（宁可不透明，也不能让图标在界面上消失）；
+///   ③ 单色图标（没有颜色位图）→ 用 mask 生成形状、颜色取黑
 fn icon_to_png(hicon: HICON) -> Option<Vec<u8>> {
     unsafe {
         let mut info: ICONINFO = std::mem::zeroed();
         if GetIconInfo(hicon, &mut info) == 0 {
             return None;
         }
+        let (w, h, mut buf);
+        if info.hbmColor.is_null() {
+            // 单色图标：mask 上半是形状，下半是 XOR（反色），高度因此是两倍
+            if info.hbmMask.is_null() {
+                return None;
+            }
+            let mut mbm: BITMAP = std::mem::zeroed();
+            if GetObjectW(
+                info.hbmMask as _,
+                std::mem::size_of::<BITMAP>() as i32,
+                &mut mbm as *mut _ as *mut core::ffi::c_void,
+            ) == 0
+            {
+                return None;
+            }
+            w = mbm.bmWidth.max(1);
+            h = (mbm.bmHeight.abs() / 2).max(1);
+            buf = vec![0u8; (w as usize) * (h as usize) * 4];
+            if !apply_mask_alpha(info.hbmMask, w, h, &mut buf) {
+                return None;
+            }
+            // 形状用黑色填充（mask 只给了透明度，没给颜色）
+            for px in buf.chunks_exact_mut(4) {
+                if px[3] > 0 {
+                    px[0] = 0;
+                    px[1] = 0;
+                    px[2] = 0;
+                }
+            }
+            return encode_png(w, h, buf);
+        }
+
         let mut bm: BITMAP = std::mem::zeroed();
         let ok = GetObjectW(
             info.hbmColor as _,
@@ -1958,14 +1468,12 @@ fn icon_to_png(hicon: HICON) -> Option<Vec<u8>> {
         );
         if ok == 0 || bm.bmWidth <= 0 || bm.bmHeight <= 0 {
             DeleteObject(info.hbmMask as _);
-            if !info.hbmColor.is_null() {
-                DeleteObject(info.hbmColor as _);
-            }
+            DeleteObject(info.hbmColor as _);
             return None;
         }
-        let w = bm.bmWidth;
-        let h = bm.bmHeight.abs();
-        let mut buf = vec![0u8; (w as usize) * (h as usize) * 4];
+        w = bm.bmWidth;
+        h = bm.bmHeight.abs();
+        buf = vec![0u8; (w as usize) * (h as usize) * 4];
         let mut bmi: BITMAPINFO = std::mem::zeroed();
         bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
         bmi.bmiHeader.biWidth = w;
@@ -1984,19 +1492,158 @@ fn icon_to_png(hicon: HICON) -> Option<Vec<u8>> {
             DIB_RGB_COLORS,
         );
         ReleaseDC(std::ptr::null_mut(), hdc);
+        if got == 0 {
+            DeleteObject(info.hbmMask as _);
+            DeleteObject(info.hbmColor as _);
+            return None;
+        }
+
+        // ① alpha 退化（老式 32bpp 图标，透明信息只在 AND mask 里）→ 用 mask 补
+        // ⚠️ 只有在 alpha **确实退化**时才动它。之前这里少了外层判断，
+        //    "mask 补不出形状 → alpha 全设 255" 会把**所有**图标的透明背景抹成黑块（黑边）。
+        let max_alpha = buf.chunks_exact(4).map(|px| px[3]).max().unwrap_or(0);
+        if max_alpha < 8 {
+            let fixed = !info.hbmMask.is_null() && apply_mask_alpha(info.hbmMask, w, h, &mut buf);
+            // ② mask 也没有形状信息 → 当成不透明，至少能看见图标
+            if !fixed {
+                for px in buf.chunks_exact_mut(4) {
+                    px[3] = 255;
+                }
+            }
+        }
+
         DeleteObject(info.hbmMask as _);
         DeleteObject(info.hbmColor as _);
+        encode_png(w, h, buf)
+    }
+}
+
+/// BGRA → RGBA 并编码 PNG
+fn encode_png(w: i32, h: i32, mut buf: Vec<u8>) -> Option<Vec<u8>> {
+    for px in buf.chunks_exact_mut(4) {
+        px.swap(0, 2);
+    }
+    let img = image::RgbaImage::from_raw(w as u32, h as u32, buf)?;
+    let mut out = Vec::new();
+    img.write_to(&mut Cursor::new(&mut out), image::ImageFormat::Png).ok()?;
+    Some(out)
+}
+
+// ---------------- Shell 取图（资源管理器同一条路径） ----------------
+
+#[repr(C)]
+struct ShellSize {
+    cx: i32,
+    cy: i32,
+}
+
+const IID_ISHELL_ITEM_IMAGE_FACTORY: windows_sys::core::GUID =
+    windows_sys::core::GUID::from_u128(0xbcc18b79_ba16_442f_80c4_8a59c30c463b);
+/// 只取图标（不要缩略图）
+const SIIGBF_ICONONLY: i32 = 0x4;
+
+/// HBITMAP（32bpp）→ PNG
+unsafe fn hbitmap_to_png(hbm: HBITMAP) -> Option<Vec<u8>> {
+    unsafe {
+        let mut bm: BITMAP = std::mem::zeroed();
+        if GetObjectW(
+            hbm as _,
+            std::mem::size_of::<BITMAP>() as i32,
+            &mut bm as *mut _ as *mut core::ffi::c_void,
+        ) == 0
+        {
+            return None;
+        }
+        let (w, h) = (bm.bmWidth, bm.bmHeight.abs());
+        // shell 保证 32bpp ARGB；不是 32bpp 说明拿到的不是我们要的东西，交给上层回落
+        if w <= 0 || h <= 0 || bm.bmBitsPixel != 32 {
+            return None;
+        }
+        let mut buf = vec![0u8; (w as usize) * (h as usize) * 4];
+        let mut bmi: BITMAPINFO = std::mem::zeroed();
+        bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+        bmi.bmiHeader.biWidth = w;
+        bmi.bmiHeader.biHeight = -h; // top-down
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = 0; // BI_RGB
+        let hdc = GetDC(std::ptr::null_mut());
+        let got = GetDIBits(
+            hdc,
+            hbm,
+            0,
+            h as u32,
+            buf.as_mut_ptr() as *mut core::ffi::c_void,
+            &mut bmi,
+            DIB_RGB_COLORS,
+        );
+        ReleaseDC(std::ptr::null_mut(), hdc);
         if got == 0 {
             return None;
         }
-        // BGRA → RGBA
-        for px in buf.chunks_exact_mut(4) {
-            px.swap(0, 2);
+        encode_png(w, h, buf)
+    }
+}
+
+/// 用 `IShellItemImageFactory::GetImage` 取图标 —— 资源管理器画图标走的就是这条，
+/// 由 shell 自己完成「32bpp 带 alpha / alpha 退化靠 AND mask / 单色」三种形态的回落，
+/// 我们不用再猜。`SHDefExtractIconW` 那条路保留作兜底（某些 .dll 资源索引它才支持）。
+fn shell_icon_png(path: &str, size: i32) -> Option<Vec<u8>> {
+    use windows_sys::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+    use windows_sys::Win32::UI::Shell::SHCreateItemFromParsingName;
+
+    unsafe {
+        // RPC_E_CHANGED_MODE：本线程已是别的套间模型，照样能用，但不能配对 CoUninitialize
+        const RPC_E_CHANGED_MODE: i32 = 0x8001_0106u32 as i32;
+        let hr_init = CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32);
+        if hr_init < 0 && hr_init != RPC_E_CHANGED_MODE {
+            return None;
         }
-        let img = image::RgbaImage::from_raw(w as u32, h as u32, buf)?;
-        let mut out = Vec::new();
-        img.write_to(&mut Cursor::new(&mut out), image::ImageFormat::Png).ok()?;
-        Some(out)
+        let paired = hr_init >= 0;
+
+        let out = (|| -> Option<Vec<u8>> {
+            let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+            let mut p: *mut core::ffi::c_void = std::ptr::null_mut();
+            let hr = SHCreateItemFromParsingName(
+                wide.as_ptr(),
+                std::ptr::null_mut(),
+                &IID_ISHELL_ITEM_IMAGE_FACTORY,
+                &mut p,
+            );
+            if hr < 0 || p.is_null() {
+                return None;
+            }
+            // IShellItemImageFactory 的 vtable：0 QueryInterface / 1 AddRef / 2 Release / 3 GetImage
+            let vtbl = *(p as *mut *const usize);
+            let release: extern "system" fn(*mut core::ffi::c_void) -> u32 =
+                std::mem::transmute(*vtbl.add(2));
+            let get_image: extern "system" fn(
+                *mut core::ffi::c_void,
+                ShellSize,
+                i32,
+                *mut HBITMAP,
+            ) -> i32 = std::mem::transmute(*vtbl.add(3));
+
+            let mut hbm: HBITMAP = std::ptr::null_mut();
+            let hr = get_image(
+                p,
+                ShellSize { cx: size, cy: size },
+                SIIGBF_ICONONLY,
+                &mut hbm,
+            );
+            release(p);
+            if hr < 0 || hbm.is_null() {
+                return None;
+            }
+            let png = hbitmap_to_png(hbm);
+            DeleteObject(hbm as _);
+            png
+        })();
+
+        if paired {
+            CoUninitialize();
+        }
+        out
     }
 }
 
@@ -2041,10 +1688,25 @@ fn get_app_icon_impl(id: String) -> Option<String> {
         source = uninstall_str;
     }
     let Some((path, index)) = parse_display_icon(&source) else { return None };
+
+    // ① 首选 Shell 取图：资源管理器怎么画，这里就怎么画。
+    //    DisplayIcon 绝大多数是 `xxx.exe,0`（index=0），这类交给 shell 最稳：
+    //    32bpp 带 alpha、alpha 退化靠 AND mask、单色图标，三种形态全由它处理。
+    // ② index ≠ 0（.dll/.ico 里的指定资源）只有 SHDefExtractIconW 支持，走兜底。
+    let png = if index == 0 {
+        shell_icon_png(&path, 48).or_else(|| extract_icon_png(&path, index))
+    } else {
+        extract_icon_png(&path, index)
+    };
+    png.map(|bytes| format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes)))
+}
+
+/// 兜底：`SHDefExtractIconW` + ICONINFO（支持资源索引，能覆盖 shell 取不到的情况）
+fn extract_icon_png(path: &str, index: i32) -> Option<Vec<u8>> {
     let wide: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
     let mut hicon_large: HICON = std::ptr::null_mut();
     let mut hicon_small: HICON = std::ptr::null_mut();
-    let hr = unsafe {
+    let _hr = unsafe {
         SHDefExtractIconW(
             wide.as_ptr(),
             index,
@@ -2054,7 +1716,14 @@ fn get_app_icon_impl(id: String) -> Option<String> {
             48 | (32 << 16),
         )
     };
-    if hr != 0 || hicon_large.is_null() {
+    // ⚠️ SHDefExtractIconW 返回 S_FALSE(1) 的含义是「成功，只是拿不到请求的尺寸」——
+    //    此时 hicon_large 依然有效。只有 hicon_large 为空才算失败。
+    if hicon_large.is_null() && !hicon_small.is_null() {
+        // 大图标拿不到时，退而用系统给的小图标（16/32px 也好过通用图标）
+        hicon_large = hicon_small;
+        hicon_small = std::ptr::null_mut();
+    }
+    if hicon_large.is_null() {
         if !hicon_small.is_null() {
             unsafe { DestroyIcon(hicon_small); }
         }
@@ -2065,7 +1734,7 @@ fn get_app_icon_impl(id: String) -> Option<String> {
     if !hicon_small.is_null() {
         unsafe { DestroyIcon(hicon_small); }
     }
-    png.map(|bytes| format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes)))
+    png
 }
 
 #[cfg(test)]
@@ -2135,5 +1804,150 @@ mod tests {
         assert_eq!(fix_msiexec(already), already);
         // 非 msiexec 的命令一律不动
         assert_eq!(fix_msiexec(r#""C:\a\unins000.exe" /S"#), r#""C:\a\unins000.exe" /S"#);
+    }
+
+    // ---- AND mask → alpha（修「图标整张透明」的核心逻辑） ----
+
+    #[test]
+    fn mask_全零表示完全不透明() {
+        let (w, h, stride) = (8usize, 2usize, 4usize);
+        let mask = vec![0u8; stride * h];
+        let mut rgba = vec![0u8; w * h * 4];
+        let t = mask_bits_to_alpha(&mask, stride, w, h, &mut rgba);
+        assert_eq!(t, 0, "mask 全 0 时不应有透明像素");
+        assert!(rgba.chunks_exact(4).all(|p| p[3] == 255), "应全部变为不透明");
+    }
+
+    #[test]
+    fn mask_位为一的像素变透明() {
+        let (w, h, stride) = (8usize, 1usize, 4usize);
+        let mut mask = vec![0u8; stride];
+        mask[0] = 0b1000_0000; // 最左像素
+        let mut rgba = vec![0u8; w * 4];
+        let t = mask_bits_to_alpha(&mask, stride, w, h, &mut rgba);
+        assert_eq!(t, 1);
+        assert_eq!(rgba[3], 0, "x=0 应透明");
+        assert_eq!(rgba[7], 255, "x=1 应不透明");
+    }
+
+    #[test]
+    fn mask_行按四字节对齐而不是按位紧排() {
+        // 48px 宽：数据 6 字节 + 2 字节对齐 = stride 8。
+        // 按 6 算会把第二行读错位（这是本 bug 最隐蔽的一种写法）
+        let (w, h, stride) = (48usize, 2usize, 8usize);
+        let mut mask = vec![0u8; stride * h];
+        mask[stride + 5] |= 0b1; // 第二行最后一个像素 x=47
+        let mut rgba = vec![0u8; w * h * 4];
+        mask_bits_to_alpha(&mask, stride, w, h, &mut rgba);
+        assert_eq!(rgba[(w + 47) * 4 + 3], 0, "第二行 x=47 应透明");
+        assert_eq!(rgba[47 * 4 + 3], 255, "第一行 x=47 不应受影响");
+    }
+
+    #[test]
+    fn mask_数据不足时不越界且不留透明洞() {
+        let (w, h, stride) = (8usize, 4usize, 4usize);
+        let mask = vec![0u8; stride]; // 只有一行
+        let mut rgba = vec![0u8; w * h * 4];
+        let t = mask_bits_to_alpha(&mask, stride, w, h, &mut rgba);
+        assert_eq!(t, 0);
+        assert!(rgba.chunks_exact(4).all(|p| p[3] == 255), "缺失的行应按不透明处理");
+    }
+
+    /// 实机诊断：把本机所有能提取到图标的软件过一遍。
+    ///
+    /// 两条判据（对应踩过的两个坑）：
+    ///   ① `alpha 全 0` 必须为 0 —— 否则图标在界面上是空白（老式 32bpp 图标）；
+    ///   ② `完全不透明` 不能过半 —— 否则说明透明背景被抹平了（表现为黑边）。
+    ///
+    /// 需要看图时设 `DM_ICON_DUMP=<目录>`，会把每个图标落盘，便于肉眼核对。
+    #[test]
+    #[ignore]
+    fn 诊断图标是否还有全透明() {
+        use winreg::enums::KEY_READ;
+        let dump = std::env::var("DM_ICON_DUMP").ok();
+        if let Some(d) = &dump {
+            let _ = std::fs::create_dir_all(d);
+        }
+        let mut bad: Vec<String> = Vec::new();
+        let mut opaque: Vec<String> = Vec::new();
+        let mut total = 0;
+        let t0 = std::time::Instant::now();
+        for hive in [HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER] {
+            for path in WIN32_UNINSTALL_PATHS {
+                let full = if hive == HKEY_CURRENT_USER {
+                    format!("Software\\{}", path.trim_start_matches("SOFTWARE\\"))
+                } else {
+                    path.to_string()
+                };
+                let Ok(root) = RegKey::predef(hive).open_subkey_with_flags(&full, KEY_READ) else { continue };
+                for key in root.enum_keys().flatten() {
+                    let id = format!("win32:{key}");
+                    let Some(url) = get_app_icon_impl(id) else { continue };
+                    match png_alpha_stats(&url) {
+                        Some((max_a, opaque_n, px)) => {
+                            if max_a < 8 {
+                                bad.push(format!("{key}（maxAlpha={max_a}）"));
+                            } else if opaque_n == px {
+                                opaque.push(key.clone());
+                            }
+                        }
+                        None => bad.push(format!("{key}（PNG 解不开）")),
+                    }
+                    if let Some(d) = &dump {
+                        let Some(b64) = url.strip_prefix("data:image/png;base64,") else { continue };
+                        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
+                            let safe: String = key
+                                .chars()
+                                .map(|c| if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
+                                .collect();
+                            let _ = std::fs::write(
+                                std::path::Path::new(d).join(format!("{safe}.png")),
+                                bytes,
+                            );
+                        }
+                    }
+                    total += 1;
+                }
+            }
+        }
+        let ms = t0.elapsed().as_millis();
+        println!(
+            "\n=== 图标诊断：共 {total} 个 · {ms}ms（单张约 {}ms）· alpha 全 0 = {} · 完全不透明 = {} ===",
+            if total > 0 { ms / total as u128 } else { 0 },
+            bad.len(),
+            opaque.len()
+        );
+        for b in &bad {
+            println!("  空白: {b}");
+        }
+        for o in opaque.iter().take(12) {
+            println!("  不透明: {o}");
+        }
+        assert!(bad.is_empty(), "仍有全透明/解不开的图标：{bad:?}");
+        assert!(
+            total == 0 || opaque.len() * 2 < total,
+            "过半图标都没有透明通道，疑似透明背景被抹平：{opaque:?}"
+        );
+    }
+
+    /// 返回 (最大 alpha, 完全不透明像素数, 总像素数)
+    fn png_alpha_stats(url: &str) -> Option<(u8, usize, usize)> {
+        let b64 = url.strip_prefix("data:image/png;base64,")?;
+        let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+        let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+        let mut max_a = 0u8;
+        let mut opaque = 0usize;
+        let mut n = 0usize;
+        for p in img.pixels() {
+            n += 1;
+            let a = p.0[3];
+            if a > max_a {
+                max_a = a;
+            }
+            if a == 255 {
+                opaque += 1;
+            }
+        }
+        Some((max_a, opaque, n))
     }
 }

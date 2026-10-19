@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import {
   Trash2, Lock, Check, Loader2, FileClock, Database, ScrollText,
   Code, FlaskConical, HardDrive, ChevronDown, ChevronRight, ScanSearch,
@@ -7,11 +7,12 @@ import {
 } from 'lucide-react'
 import type { CleanCategory, Volume } from '../types'
 import {
-  getCleanCategories, runClean, invalidateAfterClean, getVolumes, peekVolumes,
+  getCleanCategories, runClean, cancelClean, invalidateAfterClean, getVolumes, peekVolumes,
   peekCleanCategories, getLastCleanDrives, cleanFetchedAt,
 } from '../services/api'
+import type { CleanOutcome } from '../services/api'
 import { fmtBytes } from '../utils/format'
-import { useConfirm } from '../components/ConfirmDialog'
+import { useTaskDialog } from '../components/ConfirmDialog'
 import { InstallerClean } from './cleanup/InstallerClean'
 import { EmptyDirClean } from './cleanup/EmptyDirClean'
 import { EmptyArtIcon } from './cleanup/EmptyArtIcon'
@@ -22,10 +23,12 @@ import { EmptyArtIcon } from './cleanup/EmptyArtIcon'
  * idle      → 从未扫描过（本次运行内无缓存）：显示盘符选择 + 「开始扫描」
  * scanning  → 正在扫描（用户点「开始扫描」或「重新扫描」）
  * ready     → 有扫描结果（可能来自缓存，也可能刚扫完）
- * cleaning  → 正在删除
  * done      → 删除完成，并已**重新扫描**，列表与数字均为清理后的真实值
+ *
+ * ⚠️ v1.3.6 起没有 cleaning 态：清理的「确认 → 执行 → 结果」全在弹窗里，
+ * 页面不再需要一个中间态，也不会再出现进度条把顶部按钮推来推去的问题。
  */
-type Phase = 'idle' | 'scanning' | 'ready' | 'cleaning' | 'done'
+type Phase = 'idle' | 'scanning' | 'ready' | 'done'
 
 const CAT_ICON: Record<string, typeof FileClock> = {
   FileClock, Database, ScrollText, Code, FlaskConical, Trash2, HardDrive,
@@ -64,55 +67,25 @@ function JunkScan() {
       ),
     ),
   )
-  const [progress, setProgress] = useState(0)
   const [freed, setFreed] = useState(0)
   const [failed, setFailed] = useState(0)
   const [cleanedCount, setCleanedCount] = useState(0)
   /** 清理前的「可清理总量」，用于展示「清理前 → 清理后」的减少量 */
   const [beforeTotal, setBeforeTotal] = useState<number | null>(null)
   const [scannedAt, setScannedAt] = useState<number | null>(boot.at)
-  const [current, setCurrent] = useState('')
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set())
   /** 清理完成后重新统计中的标记（此期间列表显示旧值，但顶部已标明状态） */
   const [refreshing, setRefreshing] = useState(false)
   /** 清理后的重扫是否失败：失败时必须明确告知「数字可能仍是清理前状态」 */
   const [refreshFailed, setRefreshFailed] = useState(false)
+  /** 上一次清理被用户中途停止（结果条要如实说明「剩余项未处理」） */
+  const [wasCancelled, setWasCancelled] = useState(false)
 
   /**
-   * 清理进度的帧合并。
-   *
-   * 后端每删一项就推一次进度（含「正在删哪个路径」），一个软件缓存目录动辄几十项。
-   * 直接 setState 会让整页在几十毫秒内连续重渲染，叠加列表本身的布局计算，
-   * 视觉上就是「乱闪」。这里用 requestAnimationFrame 合并到每帧最多一次，
-   * 并且跳过**内容未变**的文本更新（同一个路径重复推送很常见）。
+   * 三态弹窗：确认 → 执行 → 结果。
+   * 进度、当前路径、已释放量全部在弹窗里，页面本身不再渲染清理进度。
    */
-  const progressFrame = useRef(0)
-  const pendingProgress = useRef<{ pct?: number; cur?: string }>({})
-  const currentRef = useRef('')
-
-  // 危险操作二次确认（自绘弹窗，替代 window.confirm 的原生对话框）
-  const { ask, node: confirmNode } = useConfirm()
-
-  const pushProgress = (pct?: number, cur?: string) => {
-    if (pct !== undefined) pendingProgress.current.pct = pct
-    if (cur && cur !== currentRef.current) pendingProgress.current.cur = cur
-    if (progressFrame.current) return
-    progressFrame.current = requestAnimationFrame(() => {
-      progressFrame.current = 0
-      const p = pendingProgress.current
-      pendingProgress.current = {}
-      if (p.pct !== undefined) setProgress(p.pct)
-      if (p.cur) {
-        currentRef.current = p.cur
-        setCurrent(p.cur)
-      }
-    })
-  }
-
-  // 卸载时取消挂起的帧，避免对已卸载组件 setState
-  useEffect(() => () => {
-    if (progressFrame.current) cancelAnimationFrame(progressFrame.current)
-  }, [])
+  const { run: runTask, node: taskNode } = useTaskDialog<CleanOutcome>()
 
   // 盘符列表：仅枚举（会话级缓存），不触发清理扫描
   useEffect(() => {
@@ -175,7 +148,7 @@ function JunkScan() {
     setBeforeTotal(null)
     setFreed(0)
     setFailed(0)
-    setProgress(0)
+    setWasCancelled(false)
     try {
       // 后端的真实进度：静态规则逐条推进 → 深度扫描应用缓存 → 卸载残留检查
       const cs = await getCleanCategories(true, chosen, (p) => {
@@ -233,71 +206,106 @@ function JunkScan() {
   /**
    * 执行清理 → 立刻重新统计（关键：不能让界面停留在清理前的数字）
    *
-   * 顺序：删除 → 记录「清理前总量」→ 失效缓存 → **强制重扫同盘符** → 用新结果覆盖列表与汇总
+   * 顺序：弹窗内确认 → 弹窗内执行（进度也在弹窗里）→ 弹窗显示结果 → 页面失效缓存并重扫
+   *
+   * 进度口径改了两处：
+   *   ① 条按「已完成分类 / 总分类数」推进 —— 确定性，不会因预估值偏大而长期卡在 60%；
+   *   ② 已释放字节独立显示在下面，不再拿它折算百分比。
    */
   const runCleanNow = async () => {
     const chosenItems = items.filter((i) => sel.has(i.id))
+    if (chosenItems.length === 0) return
     // 应用缓存只删目录内文件、保留目录本身，这一点必须在确认框里说清楚
     const hasAppCache = chosenItems.some((i) => i.id.startsWith('appcache:'))
-    const ok = await ask({
-      title: `清理选中的 ${chosenItems.length} 类文件`,
-      subtitle: '确认后立即执行，不经过回收站',
-      stats: [
-        { label: '预计释放', value: fmtBytes(totalSel, 2), strong: true },
-        { label: '文件类别', value: `${chosenItems.length} 类` },
-      ],
-      warning: '删除后无法恢复，本程序不提供找回功能。',
-      note: hasAppCache
-        ? '其中「应用缓存」只清空缓存目录内的文件，目录本身保留；应用下次启动会自动重建（首次打开可能略慢）。配置文件、登录数据与数据库会被自动跳过，个人设置不受影响。'
-        : undefined,
-      confirmText: '确认清理',
-    })
-    if (!ok) {
-      return
-    }
     const snapshot = totalScanned // 清理前可清理总量
     const count = chosenItems.length
-    setPhase('cleaning')
-    setProgress(0)
-    currentRef.current = ''
+
+    const outcome = await runTask(
+      {
+        title: `清理选中的 ${count} 类文件`,
+        subtitle: '确认后立即执行，不经过回收站',
+        stats: [
+          { label: '预计释放', value: fmtBytes(totalSel, 2), strong: true },
+          { label: '文件类别', value: `${count} 类` },
+        ],
+        warning: '删除后无法恢复，本程序不提供找回功能。',
+        note: hasAppCache
+          ? '其中「应用缓存」只清空缓存目录内的文件，目录本身保留；应用下次启动会自动重建（首次打开可能略慢）。配置文件、登录数据与数据库会被自动跳过，个人设置不受影响。'
+          : undefined,
+        confirmText: '确认清理',
+        runningTitle: `正在清理 ${count} 类文件`,
+        doneTitle: '清理完成',
+        stopText: '停止清理',
+        renderDone: (r) => (
+          <>
+            <div className={r?.cancelled ? 'confirm-warn' : 'confirm-note'} style={{ marginTop: 12 }}>
+              {r?.cancelled ? (
+                <span>已停止：已释放 <b className="mono">{fmtBytes(r?.freed ?? 0, 2)}</b>，剩余选中的类别没有处理。</span>
+              ) : (
+                <span>
+                  已释放 <b className="mono" style={{ color: 'var(--success)' }}>{fmtBytes(r?.freed ?? 0, 2)}</b>
+                  {' · '}处理 {count} 类
+                  {(r?.failed ?? 0) > 0 && (
+                    <span style={{ color: 'var(--warn)' }}>
+                      {' · '}{r?.failed} 项被占用或权限不足，已跳过
+                    </span>
+                  )}
+                </span>
+              )}
+            </div>
+          </>
+        ),
+      },
+      async (ctx) => {
+        const r = await runClean(
+          [...sel],
+          (p) => {
+            // 用户点了「停止清理」：把取消请求转给后端（后端在循环里每 256 个文件检查一次）
+            if (ctx.signal.aborted) void cancelClean()
+            ctx.onProgress({
+              done: p.done,
+              total: p.total ?? count,
+              current: p.current,
+              freed: p.freed,
+              pct:
+                typeof p.done === 'number' && p.total
+                  ? Math.min(99, Math.round((p.done / p.total) * 100))
+                  : typeof p.pct === 'number'
+                    ? Math.min(99, p.pct)
+                    : undefined,
+            })
+          },
+          chosen,
+          totalSel,
+        )
+        return r
+      },
+    )
+
+    // 用户在确认态就取消了：什么都不做
+    if (!outcome) return
+
+    setFreed(outcome.freed)
+    setFailed(outcome.failed)
+    setCleanedCount(count)
+    setBeforeTotal(snapshot)
+    setWasCancelled(outcome.cancelled)
+    setPhase('done')
+    // ① 让缓存失效，避免下次进入页面看到清理前的旧数据
+    invalidateAfterClean()
+    // ② 立刻重扫同一批盘符，把「剩余垃圾量」与列表刷成清理后的真实状态
+    setRefreshing(true)
+    setRefreshFailed(false)
     try {
-      const [actual, failedCount] = await runClean([...sel], (p) => {
-        // 百分比优先按「已释放 / 预估总量」算：比后端的分段百分比更贴近实际
-        const pct =
-          typeof p.freed === 'number' && totalSel > 0
-            ? Math.min(99, Math.round((p.freed / totalSel) * 100))
-            : typeof p.pct === 'number'
-              ? Math.min(99, p.pct)
-              : undefined
-        pushProgress(pct, p.current)
-      }, chosen, totalSel)
-      setProgress(100)
-      setFreed(actual)
-      setFailed(failedCount)
-      setCleanedCount(count)
-      setBeforeTotal(snapshot)
-      setPhase('done')
-      // ① 让缓存失效，避免下次进入页面看到清理前的旧数据
-      invalidateAfterClean()
-      // ② 立刻重扫同一批盘符，把「剩余垃圾量」与列表刷成清理后的真实状态
-      setRefreshing(true)
-      setRefreshFailed(false)
-      setCurrent('正在重新统计清理结果…')
-      try {
-        const cs = await getCleanCategories(true, chosen)
-        // 清理后不自动重新勾选：保持「干净」的完成态，用户要清理更多可自行勾选
-        applyResult(cs, false)
-        setScannedAt(cleanFetchedAt(chosen))
-      } catch {
-        // 重扫失败：保留删除结果，但必须标注下方数字可能过期
-        setRefreshFailed(true)
-      } finally {
-        setRefreshing(false)
-        setCurrent('')
-      }
-    } catch (e) {
-      setPhase('ready')
-      alert(`清理失败：${e}`)
+      const cs = await getCleanCategories(true, chosen)
+      // 清理后不自动重新勾选：保持「干净」的完成态，用户要清理更多可自行勾选
+      applyResult(cs, false)
+      setScannedAt(cleanFetchedAt(chosen))
+    } catch {
+      // 重扫失败：保留删除结果，但必须标注下方数字可能过期
+      setRefreshFailed(true)
+    } finally {
+      setRefreshing(false)
     }
   }
 
@@ -305,12 +313,11 @@ function JunkScan() {
     setPhase('idle')
     setCats([])
     setSel(new Set())
-    setCurrent('')
-    setProgress(0)
     setBeforeTotal(null)
     setFreed(0)
     setFailed(0)
     setCleanedCount(0)
+    setWasCancelled(false)
   }
 
   // ---- 空态 / 扫描中 ----
@@ -423,17 +430,17 @@ function JunkScan() {
           <button
             className='btn btn-ghost'
             onClick={startScan}
-            disabled={phase === 'cleaning' || refreshing || chosen.length === 0}
+            disabled={refreshing || chosen.length === 0}
             title='重新扫描所选盘符，获取最新数据（本次运行内的结果默认复用缓存，点这里才重扫）'
           >
             <RefreshCw size={14} /> 重新扫描
           </button>
-          <button className='btn btn-ghost' onClick={resetToIdle} disabled={phase === 'cleaning'}>
+          <button className='btn btn-ghost' onClick={resetToIdle}>
             <HardDrive size={14} /> 重新选择盘符
           </button>
           <button
             className='btn btn-danger'
-            disabled={totalSel === 0 || phase === 'cleaning' || refreshing}
+            disabled={totalSel === 0 || refreshing}
             onClick={runCleanNow}
             title={selCount === 0 ? '先在上方勾选要清理的项目' : '删除已勾选的项目（不进回收站）'}
           >
@@ -442,27 +449,7 @@ function JunkScan() {
         </div>
       </div>
 
-      {/*
-        清理进度独立成行，不再嵌在 .summary-bar 里。
-        原来它和 .sum-spacer 都是 flex:1，进度块宽度随「当前正在删的路径」长度变化，
-        会把右侧三个按钮推来推去 —— 这是清理时页面乱晃的直接原因之一。
-      */}
-      {phase === 'cleaning' && (
-        <div style={{ marginBottom: 14 }}>
-          <div className='progress-track' style={{ height: 6 }}>
-            <div className='progress-fill' style={{ width: `${progress}%` }} />
-          </div>
-          <div className='status-line' style={{ marginTop: 6, gap: 8 }}>
-            <Loader2 size={13} className='spin' />
-            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, minWidth: 0 }}>
-              {current || '正在删除…'}
-            </span>
-            <span className='mono' style={{ fontSize: 11.5, color: 'var(--meta)', flexShrink: 0 }}>
-              {Math.round(progress)}%
-            </span>
-          </div>
-        </div>
-      )}
+      {/* 清理进度已移入确认弹窗（三态：确认 → 执行 → 结果），页面不再渲染进度条 */}
 
       {/* 清理完成摘要：释放空间 / 清理前后对比 / 刷新状态 */}
       {isDone && (
@@ -478,11 +465,12 @@ function JunkScan() {
           }}
         >
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, color: 'var(--success)', fontWeight: 600, fontSize: 13.5, flexShrink: 0 }}>
-            <Check size={16} /> 清理完成
+            <Check size={16} /> {wasCancelled ? '已停止清理' : '清理完成'}
           </div>
           <div style={{ fontSize: 12.5, flexShrink: 0 }}>
             已释放 <b className='mono' style={{ color: 'var(--success)' }}>{fmtBytes(freed, 2)}</b>
             <span style={{ color: 'var(--meta)' }}> · 处理 {cleanedCount} 项</span>
+            {wasCancelled && <span style={{ color: 'var(--warn)' }}> · 剩余类别未处理</span>}
             {failed > 0 && (
               <span style={{ color: 'var(--warn)' }}> · {failed} 项被占用或权限不足已跳过</span>
             )}
@@ -512,9 +500,8 @@ function JunkScan() {
 
       {/*
         勾选进度：完成态且未再勾选时，改为说明文字（不再显示满格 100% 进度条）。
-        清理过程中整块隐藏 —— 此时上方已有真实删除进度，两条进度条并排反而看着乱。
       */}
-      {phase === 'cleaning' ? null : isDone && selCount === 0 ? (
+      {isDone && selCount === 0 ? (
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 16, fontSize: 11.5, color: 'var(--meta)', flexWrap: 'wrap' }}>
           <Check size={13} color="var(--success)" />
           以下为清理后的剩余项目（默认不勾选）；需要继续清理时勾选后再点右侧按钮
@@ -632,8 +619,8 @@ function JunkScan() {
         </div>
       )}
 
-      {/* 危险操作二次确认：自绘弹窗，替代原生 confirm */}
-      {confirmNode}
+      {/* 三态任务弹窗：确认 → 执行（进度在这里）→ 结果 */}
+      {taskNode}
 
       {/* 说明：不再使用底部固定 toast —— 它会一直浮在列表上挡住内容，
           且与管理上方的「清理完成」摘要条信息重复 */}

@@ -920,14 +920,20 @@ pub fn delete_rule<F: FnMut(u64, &str)>(
                 }
                 files.push(e.path().to_path_buf());
             }
-            for f in files {
+            for (i, f) in files.into_iter().enumerate() {
+                // 每 256 个文件查一次取消标志：单次检查是原子读，开销可忽略，
+                // 但能把「点停止」的响应延迟压到毫秒级（否则要等整个分类删完）
+                if i % 256 == 0 && super::clean::cancel_requested() {
+                    return;
+                }
                 let sz = f.metadata().map(|m| m.len()).unwrap_or(0);
-                match std::fs::remove_file(&f) {
-                    Ok(()) => {
-                        *freed += sz;
-                        on_progress(*freed, &f.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
-                    }
-                    Err(_) => *failed += 1,
+                // fsx 比 std::fs::remove_file 多做两件事：清只读属性、权限拒绝时修 ACL 重试。
+                // 缓存目录里这两种情况都不罕见，而以前它们都被统称为"权限不足"。
+                if super::fsx::remove_file_lenient(&f) {
+                    *freed += sz;
+                    on_progress(*freed, &f.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
+                } else {
+                    *failed += 1;
                 }
             }
             if spec.remove_self {
@@ -1243,6 +1249,8 @@ fn installed_keywords() -> Vec<String> {
 }
 
 /// 统计目录体积与文件数（限深，够用且快）
+/// 目录体积与文件数（保留给诊断与测试；清理路径已改走 fsx 的实际计数）
+#[allow(dead_code)]
 pub fn dir_size_and_files(p: &Path, max_depth: usize) -> (u64, usize) {
     let mut size = 0u64;
     let mut files = 0usize;

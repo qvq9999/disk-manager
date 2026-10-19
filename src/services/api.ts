@@ -1,7 +1,7 @@
 // ============ 数据服务层（双模式） ============
 // Tauri 环境: invoke Rust 命令（真实数据）
 // 浏览器预览: 回落 Mock（与 Tauri 命令同契约）
-import type { Volume, FileNode, CleanCategory, InstalledApp, ResidualItem, HardwareInfo, PhysicalDisk, AppSettings, CloseAction, InstallerItem, EmptyDirItem, IdentifyResult, AiAnalysis, AiConfigPublic, AiMessage, AiBatchResult } from '../types'
+import type { Volume, FileNode, CleanCategory, InstalledApp, ResidualItem, CleanReport, HardwareInfo, PhysicalDisk, AppSettings, CloseAction, InstallerItem, EmptyDirItem, IdentifyResult, AiAnalysis, AiConfigPublic, AiMessage, AiBatchResult } from '../types'
 import { Channel } from '@tauri-apps/api/core'
 
 export const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
@@ -394,22 +394,45 @@ export function invalidateAfterClean() {
   store.delete('volumes')
 }
 
+export interface CleanProgress {
+  pct?: number
+  current?: string
+  freed?: number
+  /** 已完成分类数 / 总分类数：比「已释放/预估」稳定的确定性进度 */
+  done?: number
+  total?: number
+}
+
+export interface CleanOutcome {
+  freed: number
+  failed: number
+  /** 用户中途停止：已删掉的是真删了，但剩下的没处理 */
+  cancelled: boolean
+}
+
 export async function runClean(
   ids: string[],
-  onProgress?: (p: { pct?: number; current?: string; freed?: number }) => void,
+  onProgress?: (p: CleanProgress) => void,
   drives?: string[],
   /** 前端已算好的待清理总量：传了就不必在后端重扫一遍（深度扫描后这次重扫要 1~4 秒） */
   expectedTotal?: number,
-): Promise<[number, number]> {
+): Promise<CleanOutcome> {
   if (isTauri) {
-    // 真实删除进度：Rust 端通过 Channel 实时推送 {freed, current}
-    const ch = new Channel<{ pct?: number; current?: string; freed?: number }>()
+    // 真实删除进度：Rust 端通过 Channel 实时推送 {freed, current, done, total}
+    const ch = new Channel<CleanProgress>()
     if (onProgress) {
-      ch.onmessage = (msg) => onProgress({ pct: msg.pct ?? undefined, current: msg.current, freed: msg.freed ?? undefined })
+      ch.onmessage = (msg) =>
+        onProgress({
+          pct: msg.pct ?? undefined,
+          current: msg.current,
+          freed: msg.freed ?? undefined,
+          done: msg.done ?? undefined,
+          total: msg.total ?? undefined,
+        })
     }
     // 清理范围必须与扫描范围一致，否则「扫描 E: 却删 C: 的项」
     const scope = drives && drives.length > 0 ? { drives } : null
-    return inv<[number, number]>('run_clean', {
+    return inv<CleanOutcome>('run_clean', {
       ids,
       scope,
       onProgress: ch,
@@ -422,14 +445,28 @@ export async function runClean(
     let p = 0
     const timer = setInterval(() => {
       p = Math.min(p + 8, 96)
-      onProgress?.({ pct: p })
+      onProgress?.({
+        pct: p,
+        current: '正在清理临时文件…',
+        freed: Math.round((total * p) / 100),
+      })
       if (p >= 96) {
         clearInterval(timer)
         ids.forEach((id) => mockCleaned.add(id))
-        resolve([total, 0])
+        resolve({ freed: total, failed: 0, cancelled: false })
       }
     }, 120)
   })
+}
+
+/** 请求停止清理（后端在循环里检查标志，已删掉的保留） */
+export async function cancelClean(): Promise<void> {
+  if (!isTauri) return
+  try {
+    await inv<void>('cancel_clean')
+  } catch {
+    /* 忽略：可能已经结束 */
+  }
 }
 
 // ---------------- 安装包专项清理 ----------------
@@ -619,15 +656,56 @@ export async function forceRemoveApp(id: string): Promise<UninstallOutcome> {
   return inv<UninstallOutcome>('force_remove_app', { id })
 }
 
+/**
+ * 残留扫描：把 app.id 一并传给后端。
+ *
+ * 为什么必须传 id：卸载前我们会按 id 把注册表线索快照到配置目录，
+ * 只传名称的话，卸载完成后原安装目录/发布者这些线索就再也拿不回来了。
+ */
 export async function scanResidualsFor(app: InstalledApp): Promise<ResidualItem[]> {
-  return isTauri ? inv<ResidualItem[]>('scan_app_residuals', { appName: app.name }) : mockScanResiduals(app)
+  return isTauri
+    ? inv<ResidualItem[]>('scan_app_residuals', { appName: app.name, appId: app.id })
+    : mockScanResiduals(app)
 }
 
-export async function cleanResiduals(items: ResidualItem[]): Promise<[number, number]> {
-  if (!isTauri) {
-    return [items.filter((i) => i.selected).reduce((s, i) => s + i.size, 0), 0]
+/** 卸载前主动快照线索（卸载流程内部也会做一次，这里是为了「先扫描再决定」的场景） */
+export async function prepareAppRemoval(app: InstalledApp): Promise<boolean> {
+  if (!isTauri) return true
+  try {
+    return await inv<boolean>('prepare_app_removal', { id: app.id })
+  } catch {
+    return false
   }
-  return inv<[number, number]>('clean_residuals', { items })
+}
+
+export interface ResidualCleanProgress {
+  done: number
+  total: number
+  freed: number
+  current: string
+}
+
+/**
+ * 清理残留：返回**逐项结果**（而不是只有一个失败计数）。
+ * 用户需要知道哪一项没删掉、为什么（被占用 / 需要重启 / 权限拒绝）。
+ */
+export async function cleanResiduals(
+  items: ResidualItem[],
+  onProgress?: (p: ResidualCleanProgress) => void,
+): Promise<CleanReport> {
+  if (!isTauri) {
+    const sel = items.filter((i) => i.selected)
+    return {
+      freed: sel.reduce((s, i) => s + i.size, 0),
+      ok: sel.length,
+      failed: 0,
+      pendingReboot: 0,
+      items: sel.map((i) => ({ path: i.path, ok: true, freed: i.size, pendingReboot: false })),
+    }
+  }
+  const ch = new Channel<ResidualCleanProgress>()
+  if (onProgress) ch.onmessage = (m) => onProgress(m)
+  return inv<CleanReport>('clean_residuals', { items, onProgress: ch })
 }
 
 /** 软件图标缓存：同一软件只提取一次，切页不重复请求 */
