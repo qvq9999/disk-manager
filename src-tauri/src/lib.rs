@@ -174,6 +174,7 @@ pub fn run() {
       commands::settings::resolve_close,
       commands::settings::show_main_window,
       commands::update::update_endpoint,
+      commands::update::update_prepare,
       commands::identify::identify_node,
       commands::identify::reveal_in_explorer,
       commands::identify::open_external,

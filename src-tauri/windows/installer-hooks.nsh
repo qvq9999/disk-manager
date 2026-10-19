@@ -20,8 +20,11 @@
   ; Section 里已经 SetOutPath 过一次，改完 $INSTDIR 必须重新设置输出目录，
   ; 否则 File 仍会写进原来的位置。
 
-  ; ① 正在使用的目录
-  ReadRegStr $0 HKLM "Software\qvq9999\disk-manager" "RunningFrom"
+  ; ① 正在使用的目录。应用写在 HKCU（不需要提权，一定写得进去），HKLM 作兜底
+  ReadRegStr $0 HKCU "Software\qvq9999\disk-manager" "RunningFrom"
+  ${If} $0 == ""
+    ReadRegStr $0 HKLM "Software\qvq9999\disk-manager" "RunningFrom"
+  ${EndIf}
   ${If} $0 != ""
   ${AndIf} ${FileExists} "$0\${MAINBINARYNAME}.exe"
     ${If} $0 != "$INSTDIR"
@@ -66,9 +69,11 @@
 
 !macro NSIS_HOOK_POSTINSTALL
   ; 记下这次装到哪：下次更新直接用它，不再依赖 publisher 名字拼出来的键
+  WriteRegStr HKCU "Software\qvq9999\disk-manager" "RunningFrom" "$INSTDIR"
   WriteRegStr HKLM "Software\qvq9999\disk-manager" "RunningFrom" "$INSTDIR"
   ; 通知应用：本次安装完成后清理「另一份旧安装」
   WriteRegDWORD HKLM "Software\qvq9999\disk-manager" "CleanOthers" 1
+  WriteRegDWORD HKCU "Software\qvq9999\disk-manager" "CleanOthers" 1
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL
@@ -76,6 +81,8 @@
 
 !macro NSIS_HOOK_POSTUNINSTALL
   ; 卸载完成后位置记录已无意义，避免下次安装又被指向已删除的目录
+  DeleteRegValue HKCU "Software\qvq9999\disk-manager" "RunningFrom"
+  DeleteRegValue HKCU "Software\qvq9999\disk-manager" "CleanOthers"
   DeleteRegValue HKLM "Software\qvq9999\disk-manager" "RunningFrom"
   DeleteRegValue HKLM "Software\qvq9999\disk-manager" "CleanOthers"
 !macroend

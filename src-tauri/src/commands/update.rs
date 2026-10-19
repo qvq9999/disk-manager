@@ -86,7 +86,7 @@ pub fn cleanup_update_leftovers() -> usize {
 //      用于修复已经产生了两份的机器。
 
 use std::path::{Path, PathBuf};
-use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE};
+use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE};
 use winreg::RegKey;
 
 /// ⚠️ 必须与 `windows/installer-hooks.nsh` 里的键名完全一致。
@@ -118,30 +118,64 @@ fn read_str(root: &RegKey, key: &str, name: &str) -> Option<String> {
         .ok()
 }
 
-/// 启动时记录「从哪运行的」。
+/// 开发构建目录（`target\debug` / `target\release`）不能被记成安装位置。
+fn is_dev_build_dir(dir: &Path) -> bool {
+    let s = dir.to_string_lossy().replace('/', "\\").to_ascii_lowercase();
+    s.contains("\\target\\debug") || s.contains("\\target\\release")
+}
+
+/// 启动时记录「从哪运行的」，更新时安装器就装回这个目录 —— 这是最高优先级的依据。
 ///
-/// 只在同目录存在 uninstall.exe 时写：开发时 exe 在 `target\debug` 下，
-/// 没有卸载器，不该被当成安装位置（写进去会让安装器把更新装进构建目录）。
+/// 只看是不是开发构建目录：**不再要求同目录存在 uninstall.exe**。
+/// 用户可能把程序复制到别的盘（甚至 U 盘）直接运行，那种副本没有卸载器，
+/// 但它就是"用户当前在用的那份"，更新时理应装在那里。
+///
+/// 写入顺序：HKCU 为主、HKLM 为辅。
+/// HKCU 不需要提权，任何情况下都写得进去；UAC 提权不换用户配置单元，
+/// 所以安装器（perMachine、以同一用户提权）读 HKCU 一样拿得到。
+/// 只写 HKLM 的话，万一应用以非提权方式启动，这条记录就永远写不进去。
 pub fn write_running_from() -> bool {
     let Some(dir) = current_install_dir() else { return false };
-    if !dir.join(UNINST_EXE).is_file() {
+    if is_dev_build_dir(&dir) {
         return false;
     }
-    let Ok((key, _)) = RegKey::predef(HKEY_LOCAL_MACHINE).create_subkey(META_KEY) else {
-        return false;
-    };
-    key.set_value("RunningFrom", &dir.to_string_lossy().to_string())
-        .is_ok()
+    let val = dir.to_string_lossy().to_string();
+
+    let mut ok = false;
+    if let Ok((key, _)) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(META_KEY) {
+        ok = key.set_value("RunningFrom", &val).is_ok();
+    }
+    // HKLM 尽力而为：写失败（未提权）不影响主记录
+    if let Ok((key, _)) = RegKey::predef(HKEY_LOCAL_MACHINE).create_subkey(META_KEY) {
+        let _ = key.set_value("RunningFrom", &val);
+    }
+    ok
+}
+
+/// 前端在安装更新前调用：把「当前从哪运行」再确认一次。
+///
+/// 启动时已经写过一次，这里再写是为了覆盖两种意外：启动那次写注册表失败，
+/// 或者启动之后用户把程序挪了位置。安装器只认这个值。
+#[tauri::command]
+pub fn update_prepare() -> bool {
+    write_running_from()
 }
 
 /// 安装器装完会留下标记，读一次并清掉 —— 只有刚更新过才需要清理多余安装。
+///
+/// 两个位置都看：安装器会同时写 HKCU 与 HKLM，未提权时 HKLM 清不掉也无害
+/// （清理逻辑本身幂等，目录删掉后再跑一次什么都不会做）。
 fn take_clean_flag() -> bool {
-    let Ok(key) = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(META_KEY, KEY_READ | KEY_WRITE)
-    else {
-        return false;
-    };
-    let on = key.get_value::<u32, _>("CleanOthers").map(|v| v == 1).unwrap_or(false);
-    if on {
+    let mut on = false;
+    for hive in [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE] {
+        let Ok(key) =
+            RegKey::predef(hive).open_subkey_with_flags(META_KEY, KEY_READ | KEY_WRITE)
+        else {
+            continue;
+        };
+        if key.get_value::<u32, _>("CleanOthers").map(|v| v == 1).unwrap_or(false) {
+            on = true;
+        }
         let _ = key.delete_value("CleanOthers");
     }
     on
@@ -149,25 +183,28 @@ fn take_clean_flag() -> bool {
 
 /// 所有可能藏着「另一份安装」的目录。
 fn candidate_dirs() -> Vec<PathBuf> {
-    let root = RegKey::predef(HKEY_LOCAL_MACHINE);
     let mut out: Vec<PathBuf> = Vec::new();
 
-    // ① 位置记录（新键的 RunningFrom 最准，默认值是上一次的安装目录）
-    for k in std::iter::once(META_KEY).chain(LEGACY_META_KEYS.iter().copied()) {
-        if let Some(v) = read_str(&root, k, "RunningFrom") {
-            if let Some(p) = norm_path(&v) {
-                out.push(p);
+    // ① 位置记录（RunningFrom 最准，默认值是上一次的安装目录）。
+    //    两个 hive 都要看：应用写 HKCU，安装器还会写 HKLM。
+    for hive in [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE] {
+        let root = RegKey::predef(hive);
+        for k in std::iter::once(META_KEY).chain(LEGACY_META_KEYS.iter().copied()) {
+            if let Some(v) = read_str(&root, k, "RunningFrom") {
+                if let Some(p) = norm_path(&v) {
+                    out.push(p);
+                }
             }
-        }
-        if let Some(v) = read_str(&root, k, "") {
-            if let Some(p) = norm_path(&v) {
-                out.push(p);
+            if let Some(v) = read_str(&root, k, "") {
+                if let Some(p) = norm_path(&v) {
+                    out.push(p);
+                }
             }
         }
     }
 
     // ② 卸载项里登记的安装位置（带引号）
-    if let Some(v) = read_str(&root, UNINST_KEY, "InstallLocation") {
+    if let Some(v) = read_str(&RegKey::predef(HKEY_LOCAL_MACHINE), UNINST_KEY, "InstallLocation") {
         if let Some(p) = norm_path(&v) {
             out.push(p);
         }
@@ -456,5 +493,18 @@ mod tests {
             plan_for_dir(&ghost, &std::env::temp_dir()),
             DirPlan::Skip(_)
         ));
+    }
+
+    /// 「在哪个目录打开就更新哪个目录」的前提：安装位置不能被记成构建目录，
+    /// 也不能因为路径里带 target 就误判（有人真会建 D:\target\tools）。
+    #[test]
+    fn 开发构建目录不记为安装位置() {
+        assert!(is_dev_build_dir(Path::new(r"E:\proj\src-tauri\target\debug")));
+        assert!(is_dev_build_dir(Path::new(r"E:\proj\src-tauri\target\release")));
+        assert!(is_dev_build_dir(Path::new("/e/proj/target/debug")));
+
+        assert!(!is_dev_build_dir(Path::new(r"C:\Program Files\disk-manager")));
+        assert!(!is_dev_build_dir(Path::new(r"D:\disk-manager")));
+        assert!(!is_dev_build_dir(Path::new(r"D:\target\tools")));
     }
 }

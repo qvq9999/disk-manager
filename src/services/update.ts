@@ -225,6 +225,16 @@ export async function installPendingUpdate(
     downloadAndInstall: (cb: (ev: unknown) => void, options?: { timeout?: number }) => Promise<void>
   }
 
+  // 安装器要装回「当前正在运行的这个目录」。启动时已经记过一次，
+  // 这里在动手前再确认一次：万一启动那次写注册表失败、或者程序中途被挪了位置，
+  // 都能保证更新不会装到另一个目录去。失败不阻塞 —— 安装器还有目录推断兜底。
+  try {
+    const { invoke } = await import('@tauri-apps/api/core')
+    await invoke('update_prepare')
+  } catch {
+    /* 忽略 */
+  }
+
   let total = 0
   let downloaded = 0
   await update.downloadAndInstall((ev: unknown) => {
