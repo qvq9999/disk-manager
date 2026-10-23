@@ -130,6 +130,14 @@ pub struct Rule {
 /// ⚠️ 不能把 $RECYCLE.BIN 放进通用排除，否则回收站规则会把自己排除掉（曾踩过）
 const EXCL_COMMON: &[&str] = &["System Volume Information", "*.lock"];
 
+/// `Windows\Logs` 专用排除。
+///
+/// `drive.winlogs` 是整棵 `%Drive%\Windows\Logs` 递归 `*.*`，而全局规则 `win.wulogs`
+/// 已经单独覆盖了 `Logs\WindowsUpdate`（只取 etl/log）。两条规则同时生效时，
+/// 同一批更新日志会被统计两次 —— 「可清理总量」凭空多出一份，而清理时第二遍
+/// 只能删到空气（metadata 取不到），于是出现「说有 20GB，只释放 12GB」。
+const EXCL_WINLOGS: &[&str] = &["System Volume Information", "*.lock", "WindowsUpdate"];
+
 // ---------------------------------------------------------------- 规则表
 pub static RULES: &[Rule] = &[
     // ======================= 浏览器 =======================
@@ -192,17 +200,45 @@ pub static RULES: &[Rule] = &[
         paths: &[fp("%LOCALAPPDATA%\\Microsoft\\Windows\\INetCache", "*.*", true)],
         exclude: EXCL_COMMON, default_on: true, advanced: false, warning: None, per_drive: false,
     },
+    Rule {
+        // 浏览器把着色器缓存放在 User Data **根目录**（不是 profile 子目录），
+        // 上面的 chrome/edge 规则只覆盖 profile 内的 GPUCache，这几项一直漏着。
+        // 归显卡相关：默认不勾（与 app_cache 的 gpu 判定口径一致）。
+        id: "browser.shadercache", name: "浏览器着色器缓存（显卡相关）", cat: Cat::Browser,
+        detect: &[
+            "%LOCALAPPDATA%\\Google\\Chrome\\User Data",
+            "%LOCALAPPDATA%\\Microsoft\\Edge\\User Data",
+        ],
+        paths: &[
+            fp("%LOCALAPPDATA%\\Google\\Chrome\\User Data\\ShaderCache", "*.*", true),
+            fp("%LOCALAPPDATA%\\Google\\Chrome\\User Data\\GrShaderCache", "*.*", true),
+            fp("%LOCALAPPDATA%\\Google\\Chrome\\User Data\\GPUPersistentCache", "*.*", true),
+            fp("%LOCALAPPDATA%\\Google\\Chrome\\User Data\\old_GrShaderCache_*", "*.*", true),
+            fp("%LOCALAPPDATA%\\Microsoft\\Edge\\User Data\\ShaderCache", "*.*", true),
+            fp("%LOCALAPPDATA%\\Microsoft\\Edge\\User Data\\GrShaderCache", "*.*", true),
+            fp("%LOCALAPPDATA%\\Microsoft\\Edge\\User Data\\GPUPersistentCache", "*.*", true),
+            fp("%LOCALAPPDATA%\\Microsoft\\Edge\\User Data\\old_GrShaderCache_*", "*.*", true),
+        ],
+        exclude: EXCL_COMMON, default_on: false, advanced: true,
+        warning: Some("显卡相关缓存（着色器预编译）：删除后页面首次渲染要重新编译，可能短暂卡顿。默认不勾选。"),
+        per_drive: false,
+    },
 
     // ======================= 通讯 =======================
     Rule {
-        id: "wechat.cache", name: "微信图片/视频缓存（不影响聊天记录）", cat: Cat::Chat,
-        detect: &["%APPDATA%\\Tencent\\xwechat_files"],
+        // ⚠️ 路径曾经写成 `%APPDATA%\Tencent\xwechat_files` —— 那是错的。
+        //    微信 4.x 的数据目录默认在 `%USERPROFILE%\Documents\xwechat_files`（可在设置里改盘），
+        //    缓存子目录叫 `cache`（按 YYYY-MM 分月）与 `temp\head_image`，没有 `wxcache`。
+        //    旧写法永远不命中，等于这条规则从未生效。
+        id: "wechat.cache", name: "微信缓存（不含聊天记录）", cat: Cat::Chat,
+        detect: &["%USERPROFILE%\\Documents\\xwechat_files"],
         paths: &[
-            fp("%APPDATA%\\Tencent\\xwechat_files\\wxcache", "*.*", true),
-            fp("%APPDATA%\\Tencent\\xwechat_files\\*\\temp", "*.*", true),
+            fp("%USERPROFILE%\\Documents\\xwechat_files\\*\\cache", "*.*", true),
+            fp("%USERPROFILE%\\Documents\\xwechat_files\\*\\temp\\head_image", "*.*", true),
         ],
         exclude: EXCL_COMMON, default_on: false, advanced: true,
-        warning: Some("清除后聊天中的图片/视频需重新下载，聊天记录不受影响"), per_drive: false,
+        warning: Some("只清朋友圈/视频号缓存与头像缓存。聊天图片、视频、文件与聊天数据库（db_storage）属于你的数据，不在清理范围内 —— 那些删了就永久丢失。"),
+        per_drive: false,
     },
     Rule {
         id: "wecom.cache", name: "企业微信缓存", cat: Cat::Chat,
@@ -215,12 +251,26 @@ pub static RULES: &[Rule] = &[
     },
     Rule {
         id: "qq.cache", name: "QQ 缓存与临时文件", cat: Cat::Chat,
-        detect: &["%LOCALAPPDATA%\\Tencent\\QQ"],
+        detect: &["%LOCALAPPDATA%\\Tencent\\QQ", "%APPDATA%\\Tencent\\QQ"],
         paths: &[
             fp("%LOCALAPPDATA%\\Tencent\\QQ\\Temp", "*.*", true),
-            fp("%LOCALAPPDATA%\\Tencent\\QQ\\*\\Temp", "*.*", true),
+            // NT 版把更新包暂存在这，删了下次更新重新下，不影响使用
+            fp("%APPDATA%\\Tencent\\QQ\\Temp\\QQNTdownloadcache", "*.*", true),
         ],
         exclude: EXCL_COMMON, default_on: true, advanced: false, warning: None, per_drive: false,
+    },
+    Rule {
+        // QQNT（2023 年后的新版本）缓存位置和老 QQ 不同：在 Roaming 下，
+        // 其中 WebView2 是内置浏览器缓存，社区实测常到 2~5GB。聊天记录在 `QQ\NT\User\`，不在此列。
+        id: "qqnt.cache", name: "QQ（NT 新版）内置浏览器缓存", cat: Cat::Chat,
+        detect: &["%APPDATA%\\Tencent\\QQ\\NT"],
+        paths: &[
+            fp("%APPDATA%\\Tencent\\QQ\\Cache", "*.*", true),
+            fp("%APPDATA%\\Tencent\\QQ\\WebView2", "*.*", true),
+        ],
+        exclude: EXCL_COMMON, default_on: false, advanced: true,
+        warning: Some("含内置浏览器（WebView2）缓存，删除后首次打开小程序/公众号文章会重新加载；聊天记录与接收的文件不在范围内。"),
+        per_drive: false,
     },
     Rule {
         id: "dingtalk.cache", name: "钉钉缓存", cat: Cat::Chat,
@@ -266,7 +316,9 @@ pub static RULES: &[Rule] = &[
     },
     Rule {
         id: "bilibili.cache", name: "哔哩哔哩客户端缓存", cat: Cat::Media,
-        detect: &["%LOCALAPPDATA%\\bilibili"],
+        // detect 必须覆盖两个可能的安装目录名：只认英文目录时，
+        // 装了中文目录版（`哔哩哔哩`）的用户整条规则都不显示
+        detect: &["%LOCALAPPDATA%\\bilibili", "%LOCALAPPDATA%\\哔哩哔哩"],
         paths: &[
             fp("%LOCALAPPDATA%\\bilibili\\cache", "*.*", true),
             fp("%LOCALAPPDATA%\\哔哩哔哩\\cache", "*.*", true),
@@ -292,19 +344,36 @@ pub static RULES: &[Rule] = &[
     // ======================= 游戏 =======================
     Rule {
         id: "steam.cache", name: "Steam 网页缓存与日志", cat: Cat::Game,
-        detect: &["%PROGRAMFILES(X86)%\\Steam"],
+        // 三个 detect 都要有：Steam 可能装在 Program Files / (x86) / 其它盘，
+        // 而新版客户端的网页缓存固定写在 %LOCALAPPDATA%\Steam
+        detect: &[
+            "%PROGRAMFILES(X86)%\\Steam",
+            "%PROGRAMFILES%\\Steam",
+            "%LOCALAPPDATA%\\Steam",
+        ],
         paths: &[
             fp("%PROGRAMFILES(X86)%\\Steam\\appcache", "*.*", true),
             fp("%PROGRAMFILES(X86)%\\Steam\\htmlcache", "*.*", true),
             fp("%PROGRAMFILES(X86)%\\Steam\\logs", "*.log", true),
             fp("%PROGRAMFILES(X86)%\\Steam\\config\\htmlcache", "*.*", true),
+            fp("%PROGRAMFILES%\\Steam\\appcache", "*.*", true),
+            fp("%PROGRAMFILES%\\Steam\\htmlcache", "*.*", true),
+            fp("%PROGRAMFILES%\\Steam\\logs", "*.log", true),
+            // 新客户端（CEF）把网页缓存放用户目录，安装目录下反而没有
+            fp("%LOCALAPPDATA%\\Steam\\htmlcache", "*.*", true),
         ],
         exclude: EXCL_COMMON, default_on: true, advanced: false, warning: None, per_drive: false,
     },
     Rule {
         id: "steam.depotcache", name: "Steam 下载缓存（会重新下载）", cat: Cat::Game,
-        detect: &["%PROGRAMFILES(X86)%\\Steam\\depotcache"],
-        paths: &[fp("%PROGRAMFILES(X86)%\\Steam\\depotcache", "*.*", true)],
+        detect: &[
+            "%PROGRAMFILES(X86)%\\Steam\\depotcache",
+            "%PROGRAMFILES%\\Steam\\depotcache",
+        ],
+        paths: &[
+            fp("%PROGRAMFILES(X86)%\\Steam\\depotcache", "*.*", true),
+            fp("%PROGRAMFILES%\\Steam\\depotcache", "*.*", true),
+        ],
         exclude: EXCL_COMMON, default_on: false, advanced: true,
         warning: Some("删除后更新/校验游戏时会重新下载，可能很耗时"), per_drive: false,
     },
@@ -464,10 +533,18 @@ pub static RULES: &[Rule] = &[
         exclude: EXCL_COMMON, default_on: true, advanced: false, warning: None, per_drive: false,
     },
     Rule {
-        id: "thumbcache", name: "缩略图缓存", cat: Cat::System,
+        // Win11 起缩略图并入 iconcache_*.db（实测 Win11 的 Explorer 目录里
+        // 一个 thumbcache_*.db 都没有，只有 8 个 iconcache_*.db）——
+        // 只清 thumbcache 的话这条规则在新系统上命中 0。
+        id: "thumbcache", name: "缩略图与图标缓存", cat: Cat::System,
         detect: &["%LOCALAPPDATA%\\Microsoft\\Windows\\Explorer"],
-        paths: &[fp("%LOCALAPPDATA%\\Microsoft\\Windows\\Explorer", "thumbcache_*.db", false)],
-        exclude: EXCL_COMMON, default_on: true, advanced: false, warning: None, per_drive: false,
+        paths: &[
+            fp("%LOCALAPPDATA%\\Microsoft\\Windows\\Explorer", "thumbcache_*.db", false),
+            fp("%LOCALAPPDATA%\\Microsoft\\Windows\\Explorer", "iconcache_*.db", false),
+        ],
+        exclude: EXCL_COMMON, default_on: true, advanced: false,
+        warning: Some("图标缓存常被资源管理器占用而删除失败；需要时重启资源管理器（任务管理器 → 重启 Windows 资源管理器）后重试"),
+        per_drive: false,
     },
     Rule {
         id: "crashdumps", name: "应用崩溃转储", cat: Cat::System,
@@ -481,6 +558,13 @@ pub static RULES: &[Rule] = &[
         // ⚠️ LocalCache 既是缓存目录，也是 UWP 的 ApplicationData 之一：
         //    其中 `Roaming` 存应用设置、`*.dbf` 是应用数据库，必须走保护闸
         paths: &[fp_protect("%LOCALAPPDATA%\\Packages\\*\\LocalCache", "*.*", true)],
+        exclude: EXCL_COMMON, default_on: true, advanced: false, warning: None, per_drive: false,
+    },
+    Rule {
+        // 微信 4.x 的安装包暂存目录，常留几百 MB；删了下次更新重新下
+        id: "xwechat.update", name: "微信更新包缓存", cat: Cat::System,
+        detect: &["%APPDATA%\\Tencent\\xwechat\\update"],
+        paths: &[fp("%APPDATA%\\Tencent\\xwechat\\update", "*.*", true)],
         exclude: EXCL_COMMON, default_on: true, advanced: false, warning: None, per_drive: false,
     },
     Rule {
@@ -538,9 +622,17 @@ pub static RULES: &[Rule] = &[
         exclude: EXCL_COMMON, default_on: true, advanced: false, warning: None, per_drive: true,
     },
     Rule {
+        // Win11 22H2+ 新增：系统服务专用的临时目录，与 Windows\Temp 并列存在
+        // （本机实测 C:\Windows\SystemTemp 存在）。漏掉它等于漏了一整类系统临时文件。
+        id: "drive.systtemp", name: "Windows 系统服务临时文件（SystemTemp）", cat: Cat::System,
+        detect: &[], paths: &[fp("%Drive%\\Windows\\SystemTemp", "*.*", true)],
+        exclude: EXCL_COMMON, default_on: true, advanced: false, warning: None, per_drive: true,
+    },
+    Rule {
         id: "drive.winlogs", name: "Windows 系统日志", cat: Cat::System,
         detect: &[], paths: &[fp("%Drive%\\Windows\\Logs", "*.*", true)],
-        exclude: EXCL_COMMON, default_on: true, advanced: false, warning: None, per_drive: true,
+        // 排除 WindowsUpdate：那一份由全局规则 win.wulogs 负责，否则重复统计
+        exclude: EXCL_WINLOGS, default_on: true, advanced: false, warning: None, per_drive: true,
     },
     Rule {
         id: "drive.winupdate", name: "Windows 更新缓存", cat: Cat::System,
@@ -665,7 +757,7 @@ pub static USED_FILES: &[(&'static str, &'static str, &'static str)] = &[
 
 // ---------------------------------------------------------------- 引擎实现
 
-fn env_pairs() -> Vec<(String, String)> {
+fn env_pairs() -> Vec<(&'static str, String)> {
     let keys = [
         "LOCALAPPDATA", "APPDATA", "PROGRAMDATA", "WINDIR", "SystemRoot",
         "PROGRAMFILES", "ProgramW6432", "ProgramFiles(x86)", "USERPROFILE", "TEMP",
@@ -674,22 +766,55 @@ fn env_pairs() -> Vec<(String, String)> {
     for k in keys {
         if let Ok(v) = std::env::var(k) {
             if !v.is_empty() {
-                out.push((format!("%{k}%"), v));
+                out.push((k, v));
             }
         }
     }
     out
 }
 
-fn subst(raw: &str, drive: Option<char>) -> String {
-    let mut s = raw.to_string();
+/// 解析单个占位符（`%NAME%` 里的 NAME）。**大小写不敏感**。
+///
+/// 曾经用 `str::replace("%PROGRAMFILES(X86)%", ...)` 逐条替换，而 env_pairs 产出的是
+/// `%ProgramFiles(x86)%` —— 精确匹配失败，于是 Steam 那两条规则的路径永远不会展开，
+/// `exists()` 恒假，规则静默失效（装了 Steam 也扫不出一个字节）。
+fn lookup_token(token: &str, drive: Option<char>) -> Option<String> {
+    if token.eq_ignore_ascii_case("drive") {
+        return drive.map(|d| format!("{d}:"));
+    }
     for (k, v) in env_pairs() {
-        s = s.replace(&k, &v);
+        if k.eq_ignore_ascii_case(token) {
+            return Some(v);
+        }
     }
-    if let Some(d) = drive {
-        s = s.replace("%Drive%", &format!("{d}:"));
+    None
+}
+
+fn subst(raw: &str, drive: Option<char>) -> String {
+    let mut out = String::with_capacity(raw.len() + 8);
+    let mut rest = raw;
+    while let Some(i) = rest.find('%') {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + 1..];
+        let Some(j) = after.find('%') else {
+            out.push_str(&rest[i..]); // 落单的 % ：原样输出
+            return out;
+        };
+        let token = &after[..j];
+        match lookup_token(token, drive) {
+            Some(v) => out.push_str(&v),
+            // 未知占位符原样保留：让路径展开成「不存在」而跳过，
+            // 绝不要静默拼出一个看起来合法、实则指向别处的路径
+            None => {
+                out.push('%');
+                out.push_str(token);
+                out.push('%');
+            }
+        }
+        rest = &after[j + 1..];
     }
-    s
+    out.push_str(rest);
+    out
 }
 
 /// 简单 glob：仅支持 `*`，大小写不敏感
@@ -846,9 +971,12 @@ pub fn detect_ok(rule: &Rule) -> bool {
     })
 }
 
-/// 统计一条规则在某个盘上的可清理体积
-pub fn scan_rule(rule: &Rule, drive: Option<char>) -> u64 {
-    let mut total = 0u64;
+/// 统计一条规则在某个盘上的可清理体积。
+///
+/// ⚠️ 口径由 `fsize::Tally` 统一决定（AllocationSize + 硬链接不计），
+/// 与 `delete_rule` 用的是**同一个函数** —— 否则「显示 8MB、实际清 0B」会再次出现。
+pub fn scan_rule(rule: &Rule, drive: Option<char>) -> super::fsize::Tally {
+    let mut total = super::fsize::Tally::default();
     for spec in rule.paths {
         for root in expand_paths(spec.path, drive) {
             if !root.exists() {
@@ -858,7 +986,16 @@ pub fn scan_rule(rule: &Rule, drive: Option<char>) -> u64 {
             if !spec.recurse {
                 walker = walker.max_depth(1);
             }
-            for e in walker.into_iter().filter_map(|e| e.ok()) {
+            for e in walker.into_iter() {
+                // ⚠️ 不能用 filter_map(|e| e.ok())：访问被拒的目录会被整棵丢掉，
+                //    扫描数字悄悄偏小，界面却显示"没有可清理项"。必须计数并透出。
+                let e = match e {
+                    Ok(e) => e,
+                    Err(_) => {
+                        total.denied_dirs += 1;
+                        continue;
+                    }
+                };
                 if !e.file_type().is_file() {
                     continue;
                 }
@@ -873,9 +1010,7 @@ pub fn scan_rule(rule: &Rule, drive: Option<char>) -> u64 {
                 if spec_protects(spec, &root, e.path()) {
                     continue;
                 }
-                if let Ok(m) = e.metadata() {
-                    total += m.len();
-                }
+                total.add_stat(e.path());
             }
         }
     }
@@ -887,7 +1022,7 @@ pub fn delete_rule<F: FnMut(u64, &str)>(
     rule: &Rule,
     drive: Option<char>,
     freed: &mut u64,
-    failed: &mut u32,
+    skip: &mut super::fsize::SkipStats,
     mut on_progress: F,
 ) {
     for spec in rule.paths {
@@ -901,7 +1036,15 @@ pub fn delete_rule<F: FnMut(u64, &str)>(
             }
             let mut files: Vec<PathBuf> = Vec::new();
             let mut dirs: Vec<PathBuf> = Vec::new();
-            for e in walker.into_iter().filter_map(|e| e.ok()) {
+            for e in walker.into_iter() {
+                let e = match e {
+                    Ok(e) => e,
+                    Err(_) => {
+                        // 读不进去的目录：删除阶段同样无法处理，如实计入「权限不足」
+                        skip.denied_dirs += 1;
+                        continue;
+                    }
+                };
                 if e.file_type().is_dir() {
                     if spec.remove_self && e.depth() > 0 {
                         dirs.push(e.path().to_path_buf());
@@ -926,14 +1069,15 @@ pub fn delete_rule<F: FnMut(u64, &str)>(
                 if i % 256 == 0 && super::clean::cancel_requested() {
                     return;
                 }
-                let sz = f.metadata().map(|m| m.len()).unwrap_or(0);
-                // fsx 比 std::fs::remove_file 多做两件事：清只读属性、权限拒绝时修 ACL 重试。
-                // 缓存目录里这两种情况都不罕见，而以前它们都被统称为"权限不足"。
-                if super::fsx::remove_file_lenient(&f) {
-                    *freed += sz;
-                    on_progress(*freed, &f.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
-                } else {
-                    *failed += 1;
+                // fsx 里统一记账：AllocationSize 口径、硬链接不计、错误码分类。
+                // 缓存目录里「被占用」与「权限不足」都很常见，以前它们都被统称为"权限不足"。
+                let before = *freed;
+                super::fsx::remove_file_tally(&f, freed, skip);
+                if *freed != before {
+                    on_progress(
+                        *freed,
+                        &f.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+                    );
                 }
             }
             if spec.remove_self {
@@ -1084,8 +1228,11 @@ fn dir_probe(p: &Path, max_depth: usize) -> (u64, usize, bool, Option<std::time:
         {
             exe = true;
         }
+        // 占用空间口径：残留项在界面上和垃圾项并列显示，数字必须同一把尺子
+        size += super::fsize::stat(e.path())
+            .map(|s| if s.links > 1 { 0 } else { s.alloc })
+            .unwrap_or_else(|| e.metadata().map(|m| m.len()).unwrap_or(0));
         if let Ok(m) = e.metadata() {
-            size += m.len();
             if let Ok(t) = m.modified() {
                 if newest.map(|cur| t > cur).unwrap_or(true) {
                     newest = Some(t);
@@ -1262,9 +1409,9 @@ pub fn dir_size_and_files(p: &Path, max_depth: usize) -> (u64, usize) {
     {
         if e.file_type().is_file() {
             files += 1;
-            if let Ok(m) = e.metadata() {
-                size += m.len();
-            }
+            size += super::fsize::stat(e.path())
+                .map(|s| if s.links > 1 { 0 } else { s.alloc })
+                .unwrap_or_else(|| e.metadata().map(|m| m.len()).unwrap_or(0));
         }
     }
     (size, files)
@@ -1427,6 +1574,144 @@ fn scan_uninstall_residuals_impl(min_bytes: u64, min_files: usize, idle_secs: u6
     out.sort_by(|a, b| b.size.cmp(&a.size));
     out.truncate(60);
     out
+}
+
+#[cfg(test)]
+mod rule_tests {
+    use super::*;
+
+    /// 提取 `%NAME%` 里的 NAME
+    fn tokens(raw: &str) -> Vec<&str> {
+        let mut out = Vec::new();
+        let mut rest = raw;
+        while let Some(i) = rest.find('%') {
+            let after = &rest[i + 1..];
+            let Some(j) = after.find('%') else { break };
+            out.push(&after[..j]);
+            rest = &after[j + 1..];
+        }
+        out
+    }
+
+    /// 回归测试：**所有**规则的占位符都必须能被解析。
+    ///
+    /// 这条锁的是 Steam 那个 bug：规则里写 `%PROGRAMFILES(X86)%`，
+    /// 而环境变量叫 `ProgramFiles(x86)`，大小写不匹配 → 路径不展开 → 规则静默失效。
+    /// 新增规则时若打错占位符，这里会直接失败，而不是等到用户反馈"扫不出来"。
+    #[test]
+    fn 规则占位符全部可解析() {
+        for rule in RULES {
+            for spec in rule.paths {
+                for t in tokens(spec.path) {
+                    if t.eq_ignore_ascii_case("drive") {
+                        assert!(rule.per_drive, "规则 {} 用了 %Drive% 却没标 per_drive", rule.id);
+                        continue;
+                    }
+                    assert!(
+                        lookup_token(t, None).is_some(),
+                        "规则 {} 的路径 `{}` 用了无法解析的占位符 %{}%",
+                        rule.id, spec.path, t
+                    );
+                }
+            }
+            for d in rule.detect {
+                for t in tokens(d) {
+                    assert!(
+                        lookup_token(t, None).is_some(),
+                        "规则 {} 的 detect `{}` 用了无法解析的占位符 %{}%",
+                        rule.id, d, t
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn 占位符大小写不敏感() {
+        let upper = subst("%PROGRAMFILES(X86)%\\Steam", None);
+        let mixed = subst("%ProgramFiles(x86)%\\Steam", None);
+        assert!(!upper.starts_with('%'), "大写形式没被替换：{upper}");
+        if std::env::var("ProgramFiles(x86)").is_ok() {
+            assert_eq!(upper, mixed);
+        }
+    }
+
+    #[test]
+    fn 逐盘占位符只在给了盘符时替换() {
+        assert_eq!(subst("%Drive%\\Windows\\Temp", Some('D')), "D:\\Windows\\Temp");
+        // 全局规则误用 %Drive% 时应原样保留（路径展开失败 → 跳过），不能猜一个盘
+        assert_eq!(subst("%Drive%\\Windows\\Temp", None), "%Drive%\\Windows\\Temp");
+    }
+
+    /// 诊断：打印每条规则在 C 盘的真实命中情况（只读，不删任何东西）
+    ///
+    /// `cargo test --lib 诊断清理规则命中 -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn 诊断清理规则命中() {
+        let mut total = 0u64;
+        for rule in RULES {
+            if !detect_ok(rule) {
+                println!("{:<24} detect 未通过（未安装）", rule.id);
+                continue;
+            }
+            let drive = if rule.per_drive { Some('C') } else { None };
+            let t = scan_rule(rule, drive);
+            if t.bytes == 0 && t.hardlinks == 0 {
+                continue;
+            }
+            total += t.bytes;
+            println!(
+                "{:<24} {:>10.2} MiB  files={:<7} hardlinks={:<5} hardlinkMiB={:>8.2} 无法读属性={}",
+                rule.id,
+                t.bytes as f64 / 1048576.0,
+                t.files,
+                t.hardlinks,
+                t.hardlink_bytes as f64 / 1048576.0,
+                t.unknown
+            );
+        }
+        println!("---- 合计（占用空间口径）{:>10.2} MiB", total as f64 / 1048576.0);
+    }
+
+    #[test]
+    fn 系统日志不与更新日志重复统计() {
+        let r = RULES.iter().find(|r| r.id == "drive.winlogs").expect("drive.winlogs 必须存在");
+        assert!(
+            r.exclude.iter().any(|x| x.eq_ignore_ascii_case("WindowsUpdate")),
+            "drive.winlogs 必须排除 WindowsUpdate，否则与 win.wulogs 双计"
+        );
+        assert!(
+            RULES.iter().any(|r| r.id == "win.wulogs"),
+            "win.wulogs 仍然存在，说明排除是配对的"
+        );
+    }
+
+    #[test]
+    fn 微信缓存指向Documents而不是Roaming() {
+        let r = RULES.iter().find(|r| r.id == "wechat.cache").unwrap();
+        assert!(
+            r.paths.iter().all(|s| s.path.starts_with("%USERPROFILE%\\Documents\\xwechat_files")),
+            "微信 4.x 的数据目录在 Documents，写 Roaming 会永不命中"
+        );
+        // 绝不能碰聊天数据
+        for s in r.paths {
+            let p = s.path.to_lowercase();
+            for bad in ["db_storage", "msg\\file", "msg\\attach", "msg\\video", "filestorage"] {
+                assert!(!p.contains(bad), "微信规则不得包含用户数据目录：{}", s.path);
+            }
+        }
+    }
+
+    #[test]
+    fn 显卡相关缓存默认不勾() {
+        // 用户明确要求：GPU 缓存类必须 opt-in
+        let ids = ["browser.shadercache", "d3dshader"];
+        for id in ids {
+            let r = RULES.iter().find(|r| r.id == id).unwrap_or_else(|| panic!("{id} 不存在"));
+            assert!(!r.default_on, "{id} 是显卡相关缓存，必须默认不勾");
+        }
+    }
 }
 
 #[cfg(test)]

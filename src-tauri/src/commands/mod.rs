@@ -6,6 +6,7 @@ pub mod clean_rules;
 pub mod disk;
 pub mod dupes;
 pub mod emptydir;
+pub mod fsize;
 pub mod fsx;
 pub mod hardware;
 pub mod identify;

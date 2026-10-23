@@ -39,6 +39,8 @@ pub struct DelResult {
     pub pending_reboot: bool,
     /// 曾修改过该路径的权限（takeown / icacls）
     pub acl_fixed: bool,
+    /// 逐文件的跳过明细（占用 / 权限 / 其它）
+    pub skipped: super::fsize::SkipStats,
 }
 
 impl DelResult {
@@ -53,6 +55,7 @@ impl DelResult {
             reason: Some(reason_for(code).to_string()),
             pending_reboot: false,
             acl_fixed: false,
+            skipped: Default::default(),
         }
     }
 }
@@ -172,9 +175,10 @@ pub fn remove_file(p: &Path) -> DelResult {
                         } else {
                             reason_for(e).to_string()
                         }),
-                        pending_reboot: reboot,
-                        acl_fixed: fixed,
-                    }
+                    pending_reboot: reboot,
+                    acl_fixed: fixed,
+                    skipped: Default::default(),
+                }
                 }
             }
         }
@@ -191,6 +195,7 @@ pub fn remove_file(p: &Path) -> DelResult {
                 }),
                 pending_reboot: reboot,
                 acl_fixed: false,
+                skipped: Default::default(),
             }
         }
         Err(e) => DelResult::fail(e, 0),
@@ -247,15 +252,34 @@ pub fn remove_dir(root: &Path) -> DelResult {
     let mut freed = 0u64;
     let mut errors: Vec<(PathBuf, u32)> = Vec::new();
     let mut acl_fixed = false;
+    let mut skipped = super::fsize::SkipStats::default();
 
     for f in &files {
-        let size = std::fs::metadata(f).map(|m| m.len()).unwrap_or(0);
+        // 统一口径：AllocationSize + 硬链接不计（删了不释放）
+        let st = super::fsize::stat(f);
+        let size = st
+            .map(|s| s.alloc)
+            .unwrap_or_else(|| std::fs::metadata(f).map(|m| m.len()).unwrap_or(0));
+        let links = st.map(|s| s.links).unwrap_or(1);
         match del_file_once(f) {
-            Ok(()) => freed += size,
-            Err(32) | Err(33) => errors.push((f.clone(), 32)),
-            Err(e) if e == 5 => errors.push((f.clone(), 5)),
+            Ok(()) => {
+                if links <= 1 {
+                    freed += size;
+                }
+            }
+            Err(32) | Err(33) => {
+                errors.push((f.clone(), 32));
+                skipped.record(32, size);
+            }
+            Err(e) if e == 5 => {
+                errors.push((f.clone(), 5));
+                skipped.record(5, size);
+            }
             Err(e) if e == 2 || e == 3 => {}
-            Err(e) => errors.push((f.clone(), e)),
+            Err(e) => {
+                errors.push((f.clone(), e));
+                skipped.record(e, size);
+            }
         }
     }
     for d in &dirs {
@@ -275,8 +299,12 @@ pub fn remove_dir(root: &Path) -> DelResult {
             acl_fixed = true;
             let (files2, dirs2) = collect_tree(root);
             for f in &files2 {
-                let size = std::fs::metadata(f).map(|m| m.len()).unwrap_or(0);
-                if del_file_once(f).is_ok() {
+                let st = super::fsize::stat(f);
+                let size = st
+                    .map(|s| s.alloc)
+                    .unwrap_or_else(|| std::fs::metadata(f).map(|m| m.len()).unwrap_or(0));
+                let links = st.map(|s| s.links).unwrap_or(1);
+                if del_file_once(f).is_ok() && links <= 1 {
                     freed += size;
                 }
             }
@@ -284,11 +312,11 @@ pub fn remove_dir(root: &Path) -> DelResult {
                 let _ = del_dir_once(d);
             }
             if del_dir_once(root).is_ok() {
-                return DelResult { acl_fixed, ..DelResult::ok(freed) };
+                return DelResult { acl_fixed, skipped, ..DelResult::ok(freed) };
             }
         }
     } else {
-        return DelResult { acl_fixed, ..DelResult::ok(freed) };
+        return DelResult { acl_fixed, skipped, ..DelResult::ok(freed) };
     }
 
     // 真正救不回来的那一批：能登记重启后删除的就登记，并如实标注
@@ -312,6 +340,7 @@ pub fn remove_dir(root: &Path) -> DelResult {
         )),
         pending_reboot: reboot_all && !left_files.is_empty(),
         acl_fixed,
+        skipped,
     }
 }
 
@@ -336,18 +365,44 @@ pub fn remove_path(p: &Path) -> DelResult {
 /// 轻量删除（清理缓存/空目录/安装包时用）：清属性 + 权限修复重试，但**不登记重启后删除**。
 /// 这类项目数量以万计，给每个文件写一条 PendingFileRenameOperations 会把注册表撑爆，
 /// 而且缓存文件下次启动自然会被重建，没有"必须重启删掉"的必要。
-pub fn remove_file_lenient(p: &Path) -> bool {
+///
+/// 返回**原始错误码**而不是 bool：上层要按 32 / 5 分类告诉用户
+/// 「是被占用还是权限不足」，bool 会把这个信息彻底丢掉。
+pub fn remove_file_lenient(p: &Path) -> Result<(), u32> {
     match del_file_once(p) {
-        Ok(()) => true,
-        Err(2) | Err(3) => true,
+        Ok(()) => Ok(()),
+        Err(2) | Err(3) => Ok(()), // 已经不存在，视为完成
         Err(e) => {
             if e == 5 {
                 acl_fix(p);
-                del_file_once(p).is_ok()
+                del_file_once(p).map_err(|e2| if e2 == 2 || e2 == 3 { 0 } else { e2 })
             } else {
-                false
+                Err(e)
             }
         }
+    }
+}
+
+/// 删一个文件并按**统一口径**记账：`freed` 只累加真正会释放的字节。
+///
+/// 硬链接（`NumberOfLinks > 1`）删掉只是少一个引用，空间一个字节都不会回来，
+/// 所以不累加 —— 否则 `Windows.old` 那种目录会让"已释放"凭空多出几个 GB。
+pub fn remove_file_tally(p: &Path, freed: &mut u64, skip: &mut super::fsize::SkipStats) {
+    use super::fsize;
+    let st = fsize::stat(p);
+    let bytes = st
+        .map(|s| s.alloc)
+        .unwrap_or_else(|| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0));
+    let links = st.map(|s| s.links).unwrap_or(1);
+    match remove_file_lenient(p) {
+        Ok(()) => {
+            if links <= 1 {
+                *freed += bytes;
+            }
+        }
+        // 错误码 0 = 重试时发现已不存在，不算失败
+        Err(0) => {}
+        Err(code) => skip.record(code, bytes),
     }
 }
 
@@ -395,7 +450,8 @@ mod tests {
         std::fs::set_permissions(&f, perms).unwrap();
         let r = remove_file(&f);
         assert!(r.ok, "只读文件应删除成功，实际 {:?}", r);
-        assert_eq!(r.freed, 5);
+        // 口径是占用空间，不低于文件长度即可（resident 小文件的分配粒度不是 4KB）
+        assert!(r.freed >= 5, "应统计到文件占用：{}", r.freed);
         assert!(!f.exists());
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -412,7 +468,7 @@ mod tests {
         std::fs::set_permissions(&f, perms).unwrap();
         let r = remove_dir(&d);
         assert!(r.ok, "应整体删除成功，实际 {:?}", r);
-        assert_eq!(r.freed, 4);
+        assert!(r.freed >= 4, "应统计到文件占用：{}", r.freed);
         assert!(!d.exists());
     }
 

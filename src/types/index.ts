@@ -64,6 +64,7 @@ export interface CleanItem {
   id: string
   name: string
   path: string
+  /** 可释放的占用空间（AllocationSize，非文件长度） */
   size: number
   safe: boolean // false = 系统关键/使用中，不可勾选
   lockReason?: string
@@ -72,6 +73,12 @@ export interface CleanItem {
   readOnly?: boolean // 只读项（系统占用，不可删除）
   warning?: string // 危险提示
   advanced?: boolean // 高级项标记
+  /** 硬链接文件数：删掉不释放空间，因此**未计入 size**（典型：Windows.old） */
+  hardlinks?: number
+  /** 上述硬链接文件占用的字节数 */
+  hardlinkBytes?: number
+  /** 扫描时整棵目录读不进去的数量：这些位置大小未知，size 必然偏小 */
+  deniedDirs?: number
 }
 
 export type AppType = 'win32' | 'store'

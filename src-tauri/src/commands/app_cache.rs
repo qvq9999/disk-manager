@@ -17,6 +17,7 @@
 use std::path::{Path, PathBuf};
 
 use super::clean_rules;
+use super::fsize::{SkipStats, Tally};
 
 /// 精确白名单：目录名（小写比较）必须完全等于其中之一才认定为缓存
 ///
@@ -95,6 +96,9 @@ pub struct FoundCache {
     /// 该应用下发现的缓存目录（多个：Cache / Code Cache / GPUCache…）
     pub dirs: Vec<PathBuf>,
     pub size: u64,
+    /// 硬链接文件数 / 占用（不计入 size：删了不释放空间）
+    pub hardlinks: u64,
+    pub hardlink_bytes: u64,
     /// 是否与显卡相关（着色器预编译 / 驱动预加载）
     ///
     /// 这类目录删了不会丢设置，但会让游戏与创作软件**首次启动重新编译着色器**，
@@ -165,27 +169,28 @@ fn allowed_roots() -> Vec<PathBuf> {
     out
 }
 
-fn dir_size(p: &Path) -> (u64, usize) {
-    let mut total = 0u64;
-    let mut files = 0usize;
-    for e in walkdir::WalkDir::new(p)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
+fn dir_size(p: &Path) -> Tally {
+    let mut t = Tally::default();
+    for e in walkdir::WalkDir::new(p).follow_links(false).into_iter() {
+        // 访问被拒的目录要计数，不能静默丢弃（否则"扫出来很小"其实是"没权限看"）
+        let e = match e {
+            Ok(e) => e,
+            Err(_) => {
+                t.denied_dirs += 1;
+                continue;
+            }
+        };
         if e.file_type().is_file() {
             // 与 delete_contents 同口径：被保护闸拦下的文件不计入「可清理」
             let rel = e.path().strip_prefix(p).unwrap_or(e.path());
             if clean_rules::protected_file(rel) {
                 continue;
             }
-            if let Ok(m) = e.metadata() {
-                total += m.len();
-                files += 1;
-            }
+            // 与删除端同一个统计函数：AllocationSize + 硬链接不计
+            t.add_stat(e.path());
         }
     }
-    (total, files)
+    t
 }
 
 /// 在应用目录下递归找缓存目录；命中即收集且不再下钻（缓存内部不再拆解）
@@ -269,17 +274,23 @@ fn push_found(out: &mut Vec<FoundCache>, app: String, dirs: Vec<PathBuf>, skip: 
     if kept.is_empty() {
         return;
     }
-    let mut size = 0u64;
+    let mut t = Tally::default();
     for d in &kept {
-        let (s, _files) = dir_size(d);
-        size += s;
+        t.merge(dir_size(d));
     }
     // 太小的不算（用户看不出价值，却会撑爆列表）
-    if size < 8 * 1024 * 1024 {
+    if t.bytes < 8 * 1024 * 1024 {
         return;
     }
     let gpu = gpu_related(&app, &kept);
-    out.push(FoundCache { app, dirs: kept, size, gpu });
+    out.push(FoundCache {
+        app,
+        size: t.bytes,
+        hardlinks: t.hardlinks,
+        hardlink_bytes: t.hardlink_bytes,
+        dirs: kept,
+        gpu,
+    });
 }
 
 // ---------------- 删除端：每次都要重新过一遍安全闸 ----------------
@@ -318,17 +329,26 @@ pub fn path_allowed(p: &Path) -> bool {
 /// ⚠️ 删除前逐文件过「配置文件保护闸」（`clean_rules::protected_file`）：
 ///    `LocalCache` 这类目录里混着 UWP 设置（`Roaming`）与数据库（`*.dbf`），
 ///    一律清空会让用户「软件里的个人设置全没了」。宁可少清一点缓存。
-pub fn delete_contents<F: FnMut(u64)>(dir: &Path, freed: &mut u64, failed: &mut u32, mut on_file: F) {
+pub fn delete_contents<F: FnMut(u64)>(
+    dir: &Path,
+    freed: &mut u64,
+    skip: &mut SkipStats,
+    mut on_file: F,
+) {
     if !path_allowed(dir) {
-        *failed += 1;
+        // 安全闸拒绝 ≠ 权限不足：单独归类，别混进「被占用」里误导用户
+        skip.reject(0);
         return;
     }
     let mut files: Vec<PathBuf> = Vec::new();
-    for e in walkdir::WalkDir::new(dir)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
+    for e in walkdir::WalkDir::new(dir).follow_links(false).into_iter() {
+        let e = match e {
+            Ok(e) => e,
+            Err(_) => {
+                skip.denied_dirs += 1;
+                continue;
+            }
+        };
         if e.file_type().is_file() {
             let rel = e.path().strip_prefix(dir).unwrap_or(e.path());
             if clean_rules::protected_file(rel) {
@@ -341,13 +361,11 @@ pub fn delete_contents<F: FnMut(u64)>(dir: &Path, freed: &mut u64, failed: &mut 
         if i % 256 == 0 && super::clean::cancel_requested() {
             return;
         }
-        let sz = f.metadata().map(|m| m.len()).unwrap_or(0);
-        // fsx：清只读 → 权限拒绝时修 ACL 重试（缓存目录里这两种情况很常见）
-        if super::fsx::remove_file_lenient(&f) {
-            *freed += sz;
+        // 统一口径：删除前取 AllocationSize，硬链接不计入释放量
+        let before = *freed;
+        super::fsx::remove_file_tally(&f, freed, skip);
+        if *freed != before {
             on_file(*freed);
-        } else {
-            *failed += 1;
         }
     }
 }
@@ -450,10 +468,13 @@ mod tests {
 
         assert!(path_allowed(&lc), "该测试路径应被允许：{}", lc.display());
         let mut freed = 0u64;
-        let mut failed = 0u32;
-        delete_contents(&lc, &mut freed, &mut failed, |_| {});
+        let mut skip = SkipStats::default();
+        delete_contents(&lc, &mut freed, &mut skip, |_| {});
 
-        assert_eq!(freed, 1024, "只应删掉普通缓存文件");
+        // 口径是**占用空间**（簇对齐）：1024 字节的文件在 4KB 簇上算 4KB，
+        // 所以这里不能断言等于文件长度，只断言"统计到了且没算被保护的文件"
+        assert!(freed >= 1024, "应统计到被删文件的占用：{freed}");
+        assert_eq!(skip.count(), 0, "不该有跳过项");
         assert!(lc.join("cache.dbf").is_file(), "数据库必须保留");
         assert!(lc.join("Roaming").join("settings.dat").is_file(), "Roaming 必须保留");
         assert!(lc.join("Roaming").join("user.json").is_file());
@@ -524,11 +545,12 @@ mod tests {
         assert!(path_allowed(&cache), "合法缓存路径应被允许");
 
         let mut freed = 0u64;
-        let mut failed = 0u32;
-        delete_contents(&cache, &mut freed, &mut failed, |_| {});
+        let mut skip = SkipStats::default();
+        delete_contents(&cache, &mut freed, &mut skip, |_| {});
 
-        assert_eq!(freed, 1024 + 2048 + 512, "应统计并删除全部文件");
-        assert_eq!(failed, 0, "只读文件也应成功删除");
+        // 占用空间口径（簇对齐），断言"三个文件都被算进去了"即可
+        assert!(freed >= 1024 + 2048 + 512, "应统计并删除全部文件：{freed}");
+        assert_eq!(skip.count(), 0, "只读文件也应成功删除");
         assert!(cache.is_dir(), "缓存目录本身必须保留");
         assert_eq!(
             std::fs::read_dir(&cache).unwrap().count(),

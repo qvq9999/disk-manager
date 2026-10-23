@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::clean_rules::{self, Cat, RULES, USED_FILES};
 use super::app_cache;
+use super::fsize;
 use super::fsx;
 
 /// 清理取消标志。清理可能涉及几万个文件，用户点「停止」后必须能真的停下来，
@@ -42,6 +43,10 @@ pub struct CleanScope {
 /// 扫描进度回调：百分比 + 当前动作描述
 pub type ProgressFn<'a> = &'a dyn Fn(u32, &str);
 
+/// 跳过统计定义在 `fsize`（统计口径模块），这里再导出一次，
+/// 让 `clean_rules` / `app_cache` 能共用同一套定义而不产生模块环。
+pub use super::fsize::SkipStats;
+
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct CleanItem {
@@ -65,6 +70,17 @@ pub struct CleanItem {
     /// 为 true 表示「高级项」（前端显示琥珀色徽标）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub advanced: Option<bool>,
+    /// 该清理项里硬链接文件的数量与占用。
+    /// 硬链接删掉不释放空间，所以**不计入 `size`**；但要让用户知道
+    /// 「这里其实还压着 8GB，只是删了不会还给你」（典型：Windows.old）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hardlinks: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hardlink_bytes: Option<u64>,
+    /// 扫描时整棵目录读不进去的数量：这些位置的真实大小未知，
+    /// 当它 > 0 时「可清理量」必然偏小，必须让用户看见。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub denied_dirs: Option<u64>,
 }
 
 #[derive(Serialize, Clone)]
@@ -116,8 +132,9 @@ fn collect(drives: &[char], progress: Option<ProgressFn>) -> Vec<(Cat, CleanItem
         }
         if rule.per_drive {
             for &letter in drives {
-                let size = clean_rules::scan_rule(rule, Some(letter));
-                if size == 0 {
+                let t = clean_rules::scan_rule(rule, Some(letter));
+                // 只有硬链接、没有可释放字节的项也要显示出来（否则 Windows.old 会凭空消失）
+                if t.bytes == 0 && t.hardlinks == 0 {
                     continue;
                 }
                 out.push((
@@ -130,7 +147,7 @@ fn collect(drives: &[char], progress: Option<ProgressFn>) -> Vec<(Cat, CleanItem
                             .first()
                             .map(|p| p.path.replace("%Drive%", &format!("{letter}:")))
                             .unwrap_or_default(),
-                        size,
+                        size: t.bytes,
                         safe: true,
                         lock_reason: None,
                         default_on: Some(rule.default_on),
@@ -138,12 +155,15 @@ fn collect(drives: &[char], progress: Option<ProgressFn>) -> Vec<(Cat, CleanItem
                         read_only: None,
                         warning: rule.warning.map(|w| w.to_string()),
                         advanced: if rule.advanced { Some(true) } else { None },
+                        hardlinks: if t.hardlinks > 0 { Some(t.hardlinks) } else { None },
+                        hardlink_bytes: if t.hardlinks > 0 { Some(t.hardlink_bytes) } else { None },
+                        denied_dirs: if t.denied_dirs > 0 { Some(t.denied_dirs) } else { None },
                     },
                 ));
             }
         } else {
-            let size = clean_rules::scan_rule(rule, None);
-            if size == 0 {
+            let t = clean_rules::scan_rule(rule, None);
+            if t.bytes == 0 && t.hardlinks == 0 {
                 continue;
             }
             out.push((
@@ -152,7 +172,7 @@ fn collect(drives: &[char], progress: Option<ProgressFn>) -> Vec<(Cat, CleanItem
                     id: rule.id.to_string(),
                     name: rule.name.to_string(),
                     path: rule.paths.first().map(|p| p.path.to_string()).unwrap_or_default(),
-                    size,
+                    size: t.bytes,
                     safe: true,
                     lock_reason: None,
                     default_on: Some(rule.default_on),
@@ -160,6 +180,9 @@ fn collect(drives: &[char], progress: Option<ProgressFn>) -> Vec<(Cat, CleanItem
                     read_only: None,
                     warning: rule.warning.map(|w| w.to_string()),
                     advanced: if rule.advanced { Some(true) } else { None },
+                    hardlinks: if t.hardlinks > 0 { Some(t.hardlinks) } else { None },
+                    hardlink_bytes: if t.hardlinks > 0 { Some(t.hardlink_bytes) } else { None },
+                    denied_dirs: if t.denied_dirs > 0 { Some(t.denied_dirs) } else { None },
                 },
             ));
         }
@@ -206,6 +229,9 @@ fn collect(drives: &[char], progress: Option<ProgressFn>) -> Vec<(Cat, CleanItem
                         None
                     },
                     advanced: if fc.gpu { Some(true) } else { None },
+                    hardlinks: if fc.hardlinks > 0 { Some(fc.hardlinks) } else { None },
+                    hardlink_bytes: if fc.hardlinks > 0 { Some(fc.hardlink_bytes) } else { None },
+                    denied_dirs: None,
                 },
             ));
         }
@@ -247,6 +273,9 @@ fn collect(drives: &[char], progress: Option<ProgressFn>) -> Vec<(Cat, CleanItem
                     od.files
                 )),
                 advanced: Some(true),
+                hardlinks: None,
+                hardlink_bytes: None,
+                denied_dirs: None,
             },
         ));
     }
@@ -258,7 +287,8 @@ fn collect(drives: &[char], progress: Option<ProgressFn>) -> Vec<(Cat, CleanItem
             if !p.exists() {
                 continue;
             }
-            let size = p.metadata().map(|m| m.len()).unwrap_or(0);
+            // 页面锁定文件同样按占用空间展示：用户对照资源管理器时才不会觉得"少了"
+            let size = fsize::stat(&p).map(|s| s.alloc).unwrap_or(0);
             if size == 0 {
                 continue;
             }
@@ -276,6 +306,9 @@ fn collect(drives: &[char], progress: Option<ProgressFn>) -> Vec<(Cat, CleanItem
                     read_only: Some(true),
                     warning: None,
                     advanced: None,
+                    hardlinks: None,
+                    hardlink_bytes: None,
+                    denied_dirs: None,
                 },
             ));
         }
@@ -288,11 +321,15 @@ static STATS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// 统计可清理项；scope 为空 → 默认全盘，保持向后兼容。
 /// `on_progress` 用于汇报进度：深度扫描应用缓存需要数秒，前端要能显示「正在扫哪个应用」。
+///
+/// 返回 `Result`：以前这里用 `catch_unwind(...).unwrap_or_default()`，
+/// 一旦扫描 panic 就返回**空列表**，界面显示「未发现可清理项」——
+/// 用户会以为盘很干净。现在 panic 会经由 JoinError 变成明确的错误提示。
 #[tauri::command]
 pub async fn get_clean_items(
     scope: Option<CleanScope>,
     on_progress: tauri::ipc::Channel<serde_json::Value>,
-) -> Vec<CleanCategory> {
+) -> Result<Vec<CleanCategory>, String> {
     let drives = scope.map(|s| s.drives).unwrap_or_default();
     tauri::async_runtime::spawn_blocking(move || {
         let _guard = STATS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -300,10 +337,7 @@ pub async fn get_clean_items(
         let reporter = |pct: u32, msg: &str| {
             let _ = on_progress.send(serde_json::json!({ "pct": pct, "current": msg }));
         };
-        let items = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            collect(&letters, Some(&reporter))
-        }))
-        .unwrap_or_default();
+        let items = collect(&letters, Some(&reporter));
         reporter(100, "扫描完成");
         Cat::ALL
             .iter()
@@ -317,10 +351,10 @@ pub async fn get_clean_items(
                     .map(|(_, i)| i.clone())
                     .collect(),
             })
-            .collect()
+            .collect::<Vec<_>>()
     })
     .await
-    .unwrap_or_default()
+    .map_err(|e| format!("扫描任务失败（{e}），请重试；若持续失败请反馈"))
 }
 
 #[tauri::command]
@@ -345,12 +379,22 @@ pub async fn run_clean(
 ///
 /// `cancelled` 必须单独回报：用户中途停止时，界面既要展示**已释放多少**（真删了就是真删了），
 /// 又不能把"没处理完"说成"清理完成"。
+///
+/// `skipped` 与 `diskDelta` 是回答"为什么数字对不上"的关键：
+///   - `freed` 是**按 AllocationSize 算的、真的会释放的字节**；
+///   - `skipped.bytes` 是被占用/权限不足挡住、仍然躺在盘上的字节；
+///   - `diskDelta` 是卷可用空间的实际变化（清理前后各读一次）——
+///     它会受其他进程同时写盘影响，所以只作为佐证呈现，不参与对账。
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct CleanOutcome {
     pub freed: u64,
+    /// 兼容字段 = skipped.count()（旧前端仍在读）
     pub failed: u32,
     pub cancelled: bool,
+    pub skipped: SkipStats,
+    /// 卷可用空间变化（字节）；正数=释放，负数=期间有程序写入
+    pub disk_delta: Option<i64>,
 }
 
 /// id 形态：全局规则 `rule.id`；逐盘规则 `rule.id:盘符`
@@ -371,6 +415,8 @@ fn run_clean_impl(
     expected_total: Option<u64>,
 ) -> Result<CleanOutcome, String> {
     let letters = effective_drives(drives);
+    // 清理前记一次卷可用空间：结束时再读一次，差值就是用户眼睛真正看到的"释放了多少"
+    let free_before = total_free(&letters);
     // 总量只用于进度百分比：前端能给出就不必再全量扫一遍
     let total: u64 = match expected_total {
         Some(t) => t,
@@ -383,7 +429,7 @@ fn run_clean_impl(
     };
 
     let mut freed = 0u64;
-    let mut failed = 0u32;
+    let mut skip = SkipStats::default();
     let mut cancelled = false;
     let item_total = ids.len() as u32;
 
@@ -413,11 +459,8 @@ fn run_clean_impl(
                     break;
                 }
                 let target = std::path::PathBuf::from(one);
-                if !app_cache::path_allowed(&target) {
-                    failed += 1;
-                    continue;
-                }
-                app_cache::delete_contents(&target, &mut freed, &mut failed, |f| {
+                // 安全闸复核在 delete_contents 内部做（拒绝会计入 rejected，不算失败）
+                app_cache::delete_contents(&target, &mut freed, &mut skip, |f| {
                     let _ = on_progress.send(serde_json::json!({
                         "pct": if total > 0 { ((f * 100 / total) as u32).min(99) } else { 0 },
                         "current": target
@@ -449,15 +492,13 @@ fn run_clean_impl(
                 "total": item_total,
             }));
             if !target.is_absolute() || !target.is_dir() || !clean_rules::residual_path_allowed(&target) {
-                failed += 1;
+                skip.reject(0); // 保护生效，不是失败
                 continue;
             }
-            // 走 fsx：清只读 → 权限修复重试；`freed` 只按**实际删掉**的字节计
+            // 走 fsx：清只读 → 权限修复重试；`freed` 只按**实际删掉且会释放**的字节计
             let r = fsx::remove_dir(&target);
             freed += r.freed;
-            if !r.ok {
-                failed += 1;
-            }
+            skip.merge(&r.skipped);
             continue;
         }
         let (rid, drive) = split_id(id);
@@ -469,7 +510,7 @@ fn run_clean_impl(
             "done": done,
             "total": item_total,
         }));
-        clean_rules::delete_rule(rule, drive, &mut freed, &mut failed, |f, name| {
+        clean_rules::delete_rule(rule, drive, &mut freed, &mut skip, |f, name| {
             let _ = on_progress.send(serde_json::json!({
                 "pct": if total > 0 { ((f * 100 / total) as u32).min(99) } else { 0 },
                 "current": name,
@@ -484,5 +525,28 @@ fn run_clean_impl(
         }
     }
 
-    Ok(CleanOutcome { freed, failed, cancelled })
+    // 差值可能为负：清理期间别的程序在写盘。如实呈现，不修正成"看起来对"的数字。
+    let disk_delta = match (free_before, total_free(&letters)) {
+        (Some(a), Some(b)) => Some(b as i64 - a as i64),
+        _ => None,
+    };
+
+    Ok(CleanOutcome { freed, failed: skip.count(), cancelled, skipped: skip, disk_delta })
+}
+
+/// 参与清理的盘符当前可用空间之和
+fn total_free(letters: &[char]) -> Option<u64> {
+    let mut sum = 0u64;
+    let mut any = false;
+    for &l in letters {
+        if let Some(f) = fsize::volume_free(&PathBuf::from(format!("{l}:\\"))) {
+            sum += f;
+            any = true;
+        }
+    }
+    if any {
+        Some(sum)
+    } else {
+        None
+    }
 }

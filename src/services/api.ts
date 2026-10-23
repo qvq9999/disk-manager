@@ -403,11 +403,32 @@ export interface CleanProgress {
   total?: number
 }
 
+/** 被跳过的明细：以前只有一个 failed，把「占用/权限/安全闸」混成一个数 */
+export interface CleanSkipStats {
+  /** 文件被其他进程占用（关掉对应程序可删） */
+  locked: number
+  /** 权限拒绝（已尝试取得所有权与授权） */
+  denied: number
+  /** 安全闸拒绝：这是保护生效，不是失败 */
+  rejected: number
+  /** 其它（目录非空、I/O 错误等） */
+  other: number
+  /** 整棵读不进去的目录数 */
+  deniedDirs: number
+  /** 被跳过项占用的字节数（同一口径） */
+  bytes: number
+}
+
 export interface CleanOutcome {
+  /** 真正会释放的字节（AllocationSize 口径、硬链接已排除） */
   freed: number
+  /** 兼容字段 = skipped 的总条数 */
   failed: number
   /** 用户中途停止：已删掉的是真删了，但剩下的没处理 */
   cancelled: boolean
+  skipped?: CleanSkipStats
+  /** 卷可用空间的实际变化（正=释放，负=期间有程序写入）；null=读不到 */
+  diskDelta?: number | null
 }
 
 export async function runClean(

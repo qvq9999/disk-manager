@@ -10,13 +10,60 @@ import {
   getCleanCategories, runClean, cancelClean, invalidateAfterClean, getVolumes, peekVolumes,
   peekCleanCategories, getLastCleanDrives, cleanFetchedAt,
 } from '../services/api'
-import type { CleanOutcome } from '../services/api'
+import type { CleanOutcome, CleanSkipStats } from '../services/api'
 import { fmtBytes } from '../utils/format'
 import { useTaskDialog } from '../components/ConfirmDialog'
 import { InstallerClean } from './cleanup/InstallerClean'
 import { EmptyDirClean } from './cleanup/EmptyDirClean'
 import { DupFinder } from './cleanup/DupFinder'
 import { EmptyArtIcon } from './cleanup/EmptyArtIcon'
+
+/**
+ * 清理结果里的「跳过明细」。
+ *
+ * 以前只有一句「N 项被占用或权限不足，已跳过」，有两个问题：
+ *   ① 「项」其实是**文件条数**，用户很容易理解成「N 个文件类别」；
+ *   ② 不显示被跳过的字节数 —— 「可清理量 20GB、实际释放 12GB」的差额无从解释。
+ * 现在按原因拆开列，并把仍在盘上的字节量、磁盘可用空间的实际变化一起给出。
+ */
+function SkipDetail({ skipped, delta }: { skipped?: CleanSkipStats | null; delta?: number | null }) {
+  const s = skipped
+  const parts: string[] = []
+  if (s) {
+    if (s.locked > 0) parts.push(`被程序占用 ${s.locked} 个`)
+    if (s.denied > 0) parts.push(`权限不足 ${s.denied} 个`)
+    if (s.rejected > 0) parts.push(`安全检查拦下 ${s.rejected} 个`)
+    if (s.other > 0) parts.push(`其它原因 ${s.other} 个`)
+    if (s.deniedDirs > 0) parts.push(`${s.deniedDirs} 个目录无权访问`)
+  }
+  const hasDelta = typeof delta === 'number'
+  if (parts.length === 0 && !hasDelta) return null
+  return (
+    <div style={{ marginTop: 8, fontSize: 12.5, lineHeight: 1.75 }}>
+      {parts.length > 0 && (
+        <div style={{ color: 'var(--warn)' }}>
+          未删除：{parts.join(' · ')}
+          {!!s && s.bytes > 0 && (
+            <>
+              ，这部分约 <b className='mono'>{fmtBytes(s.bytes, 2)}</b> 仍占着磁盘
+            </>
+          )}
+          。关掉对应程序后再清理一次通常就能删掉。
+        </div>
+      )}
+      {hasDelta && (
+        <div className='confirm-note' style={{ marginTop: 4 }}>
+          磁盘可用空间实际变化{' '}
+          <b className='mono'>
+            {delta >= 0 ? '+' : '−'}
+            {fmtBytes(Math.abs(delta), 2)}
+          </b>
+          <span style={{ opacity: 0.72 }}>（清理期间其它程序也在读写，与「已释放」略有出入属正常）</span>
+        </div>
+      )}
+    </div>
+  )
+}
 
 /**
  * 页面状态机
@@ -69,7 +116,10 @@ function JunkScan() {
     ),
   )
   const [freed, setFreed] = useState(0)
-  const [failed, setFailed] = useState(0)
+  /** 跳过明细（占用 / 权限 / 安全闸 / 目录无权访问）+ 被跳过的字节数 */
+  const [skipped, setSkipped] = useState<CleanSkipStats | null>(null)
+  /** 卷可用空间的实际变化（正=释放，负=期间有程序写入） */
+  const [diskDelta, setDiskDelta] = useState<number | null>(null)
   const [cleanedCount, setCleanedCount] = useState(0)
   /** 清理前的「可清理总量」，用于展示「清理前 → 清理后」的减少量 */
   const [beforeTotal, setBeforeTotal] = useState<number | null>(null)
@@ -148,7 +198,8 @@ function JunkScan() {
     setScanMsg('')
     setBeforeTotal(null)
     setFreed(0)
-    setFailed(0)
+    setSkipped(null)
+    setDiskDelta(null)
     setWasCancelled(false)
     try {
       // 后端的真实进度：静态规则逐条推进 → 深度扫描应用缓存 → 卸载残留检查
@@ -177,6 +228,12 @@ function JunkScan() {
   const selCount = items.filter((i) => sel.has(i.id)).length
   /** 清理后相比清理前减少的可清理量 */
   const reduced = beforeTotal !== null ? Math.max(0, beforeTotal - totalScanned) : 0
+
+  /** 跳过汇总：条数（安全闸拒绝也算，但语义不同，明细里分开列）+ 仍在盘上的字节 */
+  const skipTotal = skipped
+    ? skipped.locked + skipped.denied + skipped.rejected + skipped.other
+    : 0
+  const skipBytes = skipped?.bytes ?? 0
 
   const toggle = (id: string) =>
     setSel((s) => {
@@ -226,13 +283,19 @@ function JunkScan() {
         title: `清理选中的 ${count} 类文件`,
         subtitle: '确认后立即执行，不经过回收站',
         stats: [
-          { label: '预计释放', value: fmtBytes(totalSel, 2), strong: true },
+          // 口径说明：这是「按占用空间算出来的上限」，运行中的程序会挡住一部分
+          { label: '可清理量（上限）', value: fmtBytes(totalSel, 2), strong: true },
           { label: '文件类别', value: `${count} 类` },
         ],
         warning: '删除后无法恢复，本程序不提供找回功能。',
-        note: hasAppCache
-          ? '其中「应用缓存」只清空缓存目录内的文件，目录本身保留；应用下次启动会自动重建（首次打开可能略慢）。配置文件、登录数据与数据库会被自动跳过，个人设置不受影响。'
-          : undefined,
+        note: [
+          '正在运行的程序（浏览器、微信、QQ、播放器等）占用的缓存文件无法删除，会被跳过并如实列出。',
+          hasAppCache
+            ? '其中「应用缓存」只清空缓存目录内的文件，目录本身保留；应用下次启动会自动重建（首次打开可能略慢）。配置文件、登录数据与数据库会被自动跳过，个人设置不受影响。'
+            : '',
+        ]
+          .filter(Boolean)
+          .join('\n'),
         confirmText: '确认清理',
         runningTitle: `正在清理 ${count} 类文件`,
         doneTitle: '清理完成',
@@ -246,14 +309,10 @@ function JunkScan() {
                 <span>
                   已释放 <b className="mono" style={{ color: 'var(--success)' }}>{fmtBytes(r?.freed ?? 0, 2)}</b>
                   {' · '}处理 {count} 类
-                  {(r?.failed ?? 0) > 0 && (
-                    <span style={{ color: 'var(--warn)' }}>
-                      {' · '}{r?.failed} 项被占用或权限不足，已跳过
-                    </span>
-                  )}
                 </span>
               )}
             </div>
+            <SkipDetail skipped={r?.skipped} delta={r?.diskDelta} />
           </>
         ),
       },
@@ -287,7 +346,8 @@ function JunkScan() {
     if (!outcome) return
 
     setFreed(outcome.freed)
-    setFailed(outcome.failed)
+    setSkipped(outcome.skipped ?? null)
+    setDiskDelta(typeof outcome.diskDelta === 'number' ? outcome.diskDelta : null)
     setCleanedCount(count)
     setBeforeTotal(snapshot)
     setWasCancelled(outcome.cancelled)
@@ -316,7 +376,8 @@ function JunkScan() {
     setSel(new Set())
     setBeforeTotal(null)
     setFreed(0)
-    setFailed(0)
+    setSkipped(null)
+    setDiskDelta(null)
     setCleanedCount(0)
     setWasCancelled(false)
   }
@@ -472,8 +533,11 @@ function JunkScan() {
             已释放 <b className='mono' style={{ color: 'var(--success)' }}>{fmtBytes(freed, 2)}</b>
             <span style={{ color: 'var(--meta)' }}> · 处理 {cleanedCount} 项</span>
             {wasCancelled && <span style={{ color: 'var(--warn)' }}> · 剩余类别未处理</span>}
-            {failed > 0 && (
-              <span style={{ color: 'var(--warn)' }}> · {failed} 项被占用或权限不足已跳过</span>
+            {skipTotal > 0 && (
+              <span style={{ color: 'var(--warn)' }}>
+                {' · '}跳过 {skipTotal} 个文件
+                {skipBytes > 0 && <>（{(skipBytes / (freed + skipBytes) * 100).toFixed(0)}% 仍在盘上）</>}
+              </span>
             )}
           </div>
           <div style={{ fontSize: 12.5, color: 'var(--muted)', display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 }}>
@@ -496,6 +560,13 @@ function JunkScan() {
               以上为清理后重新扫描的真实结果 · {hhmm(scannedAt)}
             </span>
           )}
+        </div>
+      )}
+
+      {/* 跳过明细 + 磁盘实际变化：页面顶部只放一句话，明细在这里展开 */}
+      {isDone && (
+        <div style={{ marginTop: -8, marginBottom: 14 }}>
+          <SkipDetail skipped={skipped} delta={diskDelta} />
         </div>
       )}
 
@@ -600,6 +671,24 @@ function JunkScan() {
                                 )}
                                 {i.safe && i.warning && (
                                   <span className='tag tag-bundle' style={{ marginLeft: 6 }}>有风险</span>
+                                )}
+                                {!!i.hardlinks && (
+                                  <span
+                                    className='tag tag-warn'
+                                    style={{ marginLeft: 6 }}
+                                    title={`其中 ${i.hardlinks} 个文件是硬链接（约 ${fmtBytes(i.hardlinkBytes ?? 0, 1)}）。删除硬链接不会释放磁盘空间，所以没有计入左侧大小。`}
+                                  >
+                                    硬链接不计
+                                  </span>
+                                )}
+                                {!!i.deniedDirs && (
+                                  <span
+                                    className='tag tag-warn'
+                                    style={{ marginLeft: 6 }}
+                                    title={`有 ${i.deniedDirs} 个目录当前无权访问，里面的内容没有统计，实际大小可能更大。`}
+                                  >
+                                    {i.deniedDirs} 目录无权访问
+                                  </span>
                                 )}
                                 {isDone && i.size === 0 && (
                                   <span className='tag tag-safe' style={{ marginLeft: 6 }}>已清理</span>
